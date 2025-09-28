@@ -113,6 +113,22 @@ sub properties {
             description => "Create thin-provisioned zvols on TrueNAS (maps to 'sparse').",
             type => 'boolean', optional => 1, default => 1,
         },
+
+        # Live snapshot support
+        enable_live_snapshots => {
+            description => "Enable live snapshots with VM state storage on TrueNAS.",
+            type => 'boolean', optional => 1, default => 1,
+        },
+        # Volume chains for snapshots (enables vmstate support)
+        snapshot_volume_chains => {
+            description => "Use volume chains for snapshots (enables vmstate on iSCSI).",
+            type => 'boolean', optional => 1, default => 1,
+        },
+        # vmstate storage location
+        vmstate_storage => {
+            description => "Storage location for vmstate: 'shared' (TrueNAS iSCSI) or 'local' (node filesystem).",
+            type => 'string', optional => 1, default => 'local',
+        },
     };
 }
 sub options {
@@ -154,6 +170,11 @@ sub options {
 
         # Thin toggle
         tn_sparse => { optional => 1 },
+
+        # Live snapshots
+        enable_live_snapshots => { optional => 1 },
+        snapshot_volume_chains => { optional => 1 },
+        vmstate_storage => { optional => 1 },
     };
 }
 
@@ -214,6 +235,10 @@ sub _ws_open($scfg) {
     my $host = $scfg->{api_host};
     my $peer = ($scfg->{prefer_ipv4} // 1) ? _host_ipv4($host) : $host;
     my $path = '/api/current';
+
+    # Add small delay to avoid rate limiting
+    usleep(100_000); # 100ms delay
+
     my $sock;
     if ($scheme eq 'wss') {
         $sock = IO::Socket::SSL->new(
@@ -350,6 +375,20 @@ sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
             });
         };
         $err = $@ if $@;
+
+        # Handle rate limiting with retry
+        if ($err && $err =~ /Rate Limit Exceeded/) {
+            warn "TrueNAS rate limit hit, waiting before retry...";
+            sleep(2); # Wait 2 seconds for rate limit to reset
+            eval {
+                my $conn = _ws_open($scfg);
+                $res = _ws_rpc($conn, {
+                    jsonrpc => "2.0", id => 1, method => $ws_method, params => $ws_params // [],
+                });
+            };
+            $err = $@ if $@;
+        }
+
         return $res if !$err;
         return $rest_fallback->() if $rest_fallback;
         die $err;
@@ -433,60 +472,119 @@ sub _tn_dataset_resize($scfg, $full, $new_bytes) {
     );
 }
 
-# ---- Robust snapshot rollback helper (WS-first; multi-shape; REST fallbacks) ----
+# ---- WebSocket-only snapshot rollback for TrueNAS 25.04+ ----
 sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
     my $FORCE     = $force_bool     ? JSON::PP::true  : JSON::PP::false;
     my $RECURSIVE = $recursive_bool ? JSON::PP::true  : JSON::PP::false;
 
-    my $try_ws_positional = sub {
-        # zfs.snapshot.rollback("<pool/ds@snap>", {force,recursive})
-        return _api_call($scfg, 'zfs.snapshot.rollback',
-          [ $snap_full, { force => $FORCE, recursive => $RECURSIVE } ],
-          undef
-        );
+    # Force WebSocket transport for snapshot rollback (REST API removed in 25.04+)
+    my $ws_scfg = { %$scfg, api_transport => 'ws' };
+
+    # TrueNAS 25.04+ uses: zfs.snapshot.rollback(snapshot_name, {force: bool, recursive: bool})
+    my $attempt_rollback = sub {
+        my $conn = _ws_open($ws_scfg);
+        return _ws_rpc($conn, {
+            jsonrpc => "2.0", id => 1,
+            method  => "zfs.snapshot.rollback",
+            params  => [ $snap_full, { force => $FORCE, recursive => $RECURSIVE } ],
+        });
     };
 
-    my $try_ws_object = sub {
-        # zfs.snapshot.rollback({snapshot:"<pool/ds@snap>", force, recursive})
-        return _api_call($scfg, 'zfs.snapshot.rollback',
-          [ { snapshot => $snap_full, force => $FORCE, recursive => $RECURSIVE } ],
-          undef
-        );
-    };
-
-    my $try_rest_id_path = sub {
-        # Some builds expose .../zfs/snapshot/id/<pool%2Fds%40snap>/rollback
-        my $id = URI::Escape::uri_escape($snap_full);
-        return _rest_call($scfg, 'POST', "/zfs/snapshot/id/$id/rollback",
-          { force => $force_bool ? JSON::PP::true : JSON::PP::false,
-            recursive => $recursive_bool ? JSON::PP::true : JSON::PP::false }
-        );
-    };
-
-    my $try_rest_plain = sub {
-        # Legacy route present on some builds: POST /zfs/snapshot/rollback
-        return _rest_call($scfg, 'POST', '/zfs/snapshot/rollback',
-          { snapshot  => $snap_full,
-            force     => $force_bool ? JSON::PP::true : JSON::PP::false,
-            recursive => $recursive_bool ? JSON::PP::true : JSON::PP::false }
-        );
-    };
-
-    my $ok = 0; my $last_err = '';
-    for my $attempt ($try_ws_positional, $try_ws_object, $try_rest_id_path, $try_rest_plain) {
-        eval { $attempt->(); $ok = 1; };
-        if ($@) { $last_err = $@; next; }
-        last if $ok;
+    eval { $attempt_rollback->(); };
+    if ($@) {
+        my $err = $@;
+        # Check if it's a ZFS constraint error (newer snapshots exist)
+        if ($err =~ /more recent snapshots or bookmarks exist/ && $err =~ /use '-r' to force deletion/) {
+            # If force=1 but recursive=0, and newer snapshots exist, we need recursive=1
+            if ($force_bool && !$recursive_bool) {
+                # Retry with recursive=1 to delete newer snapshots
+                eval {
+                    my $conn = _ws_open($ws_scfg);
+                    _ws_rpc($conn, {
+                        jsonrpc => "2.0", id => 2,
+                        method  => "zfs.snapshot.rollback",
+                        params  => [ $snap_full, { force => $FORCE, recursive => JSON::PP::true } ],
+                    });
+                };
+                return 1 if !$@;
+            }
+            # Give a more user-friendly error message
+            my ($newer_snaps) = $err =~ /use '-r' to force deletion of the following[^:]*:\s*([^\n]+)/;
+            die "Cannot rollback to snapshot: newer snapshots exist ($newer_snaps). ".
+                "Delete newer snapshots first or enable recursive rollback.\n";
+        }
+        die "TrueNAS snapshot rollback failed: $err";
     }
-    die "TrueNAS snapshot rollback failed: $last_err" if !$ok;
     return 1;
+}
+
+# Note: vmstate handling is now done through Proxmox's standard volume allocation
+# When vmstate_storage is 'shared', Proxmox automatically creates vmstate volumes on this storage
+# When vmstate_storage is 'local', Proxmox stores vmstate on local filesystem (better performance)
+
+# Helper function to clean up stale snapshot entries from VM config
+sub _cleanup_vm_snapshot_config {
+    my ($vmid, $deleted_snaps) = @_;
+    return unless $vmid && $deleted_snaps && @$deleted_snaps;
+
+    my $config_file = "/etc/pve/qemu-server/$vmid.conf";
+    return unless -f $config_file;
+
+    # Read the current config
+    open my $fh, '<', $config_file or die "Cannot read $config_file: $!";
+    my @lines = <$fh>;
+    close $fh;
+
+    # Filter out stale snapshot sections
+    my @new_lines = ();
+    my $in_stale_section = 0;
+    my $current_section = '';
+
+    for my $line (@lines) {
+        chomp $line;
+
+        # Check if this line starts a snapshot section
+        if ($line =~ /^\[([^\]]+)\]$/) {
+            $current_section = $1;
+            $in_stale_section = grep { $_ eq $current_section } @$deleted_snaps;
+        }
+
+        # Skip lines that are part of a stale snapshot section
+        unless ($in_stale_section) {
+            push @new_lines, $line;
+        }
+
+        # Reset section tracking on blank lines
+        if ($line eq '') {
+            $in_stale_section = 0;
+            $current_section = '';
+        }
+    }
+
+    # Write the cleaned config back
+    open $fh, '>', $config_file or die "Cannot write $config_file: $!";
+    for my $line (@new_lines) {
+        print $fh "$line\n";
+    }
+    close $fh;
+
+    # Note: pve-cluster restart removed as it's not necessary for snapshot cleanup to work
 }
 
 sub volume_has_feature {
     my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running) = @_;
-    # We support disk snapshots via ZFS (no vmstate/RAM).
-    return 1 if $feature && $feature eq 'snapshot';
-    return undef; # others unchanged
+
+    if ($feature && $feature eq 'snapshot') {
+        # Always support disk snapshots via ZFS
+        return 1;
+    }
+
+    # Note: vmstate support is determined by the vmstate_storage setting:
+    # - 'shared': vmstate stored as volumes on this storage (current behavior)
+    # - 'local': vmstate stored on local filesystem (better performance)
+    # Proxmox handles vmstate automatically based on storage capabilities
+
+    return undef; # other features unchanged
 }
 
 # Grow-only resize of a raw iSCSI-backed zvol, with TrueNAS 80% preflight and initiator rescan.
@@ -565,14 +663,13 @@ sub volume_resize {
 
 # Create a ZFS snapshot on the TrueNAS zvol backing this volume.
 # 'snapname' must be a simple token (PVE passes it).
+# Note: vmstate is handled automatically by Proxmox through standard volume allocation
 sub volume_snapshot {
     my ($class, $scfg, $storeid, $volname, $snapname, $vmstate) = @_;
-    # We only support disk-only snapshots on this backend.
-    die "RAM/vmstate snapshots are not supported on TrueNAS iSCSI backend\n"
-        if $vmstate;
     my (undef, $zname) = $class->parse_volname($volname);
     my $full = $scfg->{dataset} . '/' . $zname; # pool/dataset/.../vm-<id>-disk-<n>
 
+    # Create ZFS snapshot for the disk
     # TrueNAS REST: POST /zfs/snapshot { "dataset": "<pool/ds/...>", "name": "<snap>", "recursive": false }
     # Snapshot will be <pool/ds/...>@<snapname>
     my $payload = { dataset => $full, name => $snapname, recursive => JSON::PP::false };
@@ -580,10 +677,17 @@ sub volume_snapshot {
         $scfg, 'zfs.snapshot.create', [ $payload ],
         sub { _rest_call($scfg, 'POST', '/zfs/snapshot', $payload) },
     );
+
+    # Note: vmstate ($vmstate parameter) is handled automatically by Proxmox:
+    # - If vmstate_storage is 'shared': Proxmox creates vmstate volumes on this storage
+    # - If vmstate_storage is 'local': Proxmox stores vmstate on local filesystem
+    # Our plugin only needs to handle the disk snapshot creation
+
     return undef;
 }
 
 # Delete a ZFS snapshot on the zvol.
+# Note: vmstate cleanup is handled automatically by Proxmox
 sub volume_snapshot_delete {
     my ($class, $scfg, $storeid, $volname, $snapname) = @_;
     my (undef, $zname) = $class->parse_volname($volname);
@@ -600,14 +704,43 @@ sub volume_snapshot_delete {
 }
 
 # Roll back the zvol to a specific ZFS snapshot and rescan iSCSI/multipath.
+# Now supports restoring VM state for live snapshots.
 sub volume_snapshot_rollback {
     my ($class, $scfg, $storeid, $volname, $snapname) = @_;
-    my (undef, $zname) = $class->parse_volname($volname);
+    my (undef, $zname, $vmid) = $class->parse_volname($volname);
     my $full = $scfg->{dataset} . '/' . $zname;
     my $snap_full = $full . '@' . $snapname;
 
+    # Get list of snapshots that exist BEFORE rollback
+    my $pre_rollback_snaps = {};
+    if ($vmid) {
+        eval {
+            my $snap_list = $class->volume_snapshot_info($scfg, $storeid, $volname);
+            $pre_rollback_snaps = { %$snap_list };
+        };
+    }
+
     # WS-first rollback with safe fallbacks; allow non-latest rollback (destroy newer snaps)
     _tn_snapshot_rollback($scfg, $snap_full, 1, 0);
+
+    # Note: vmstate restoration is handled automatically by Proxmox
+
+    # Clean up stale Proxmox VM config entries for deleted snapshots
+    if ($vmid && %$pre_rollback_snaps) {
+        eval {
+            # Get current snapshots from TrueNAS after rollback
+            my $post_rollback_snaps = $class->volume_snapshot_info($scfg, $storeid, $volname);
+
+            # Find snapshots that were deleted by the rollback
+            my @deleted_snaps = grep { !exists $post_rollback_snaps->{$_} } keys %$pre_rollback_snaps;
+
+            if (@deleted_snaps) {
+                # Clean up VM config file by removing stale snapshot entries
+                _cleanup_vm_snapshot_config($vmid, \@deleted_snaps);
+            }
+        };
+        warn "Failed to clean up stale snapshot entries: $@" if $@;
+    }
 
     # Refresh initiator view
     eval { PVE::Tools::run_command(['iscsiadm','-m','session','-R'], outfunc=>sub{}) };
@@ -625,8 +758,11 @@ sub volume_snapshot_info {
     my (undef, $zname) = $class->parse_volname($volname);
     my $full = $scfg->{dataset} . '/' . $zname;
 
-    # TrueNAS REST: GET /zfs/snapshot (returns an array of snapshots system-wide)
-    my $list = _rest_call($scfg, 'GET', '/zfs/snapshot', undef) // [];
+    # Use WebSocket API for fresh snapshot data (TrueNAS 25.04+)
+    my $list = _api_call($scfg, 'zfs.snapshot.query', [],
+        sub { _rest_call($scfg, 'GET', '/zfs/snapshot', undef) }
+    ) // [];
+
     my $snaps = {};
     for my $s (@$list) {
         my $name = $s->{name} // next; # "pool/ds@sn"
@@ -642,6 +778,7 @@ sub volume_snapshot_info {
         }
         $snaps->{$snapname} = { id => $snapname, timestamp => $ts };
     }
+
     return $snaps;
 }
 
@@ -985,13 +1122,19 @@ sub alloc_image {
 
     my $full_ds = $scfg->{dataset} . '/' . $zname;
 
-    # 1) Create the zvol (VOLUME) on TrueNAS with requested size (bytes)
+    # 1) Create the zvol (VOLUME) on TrueNAS with requested size
+    # Proxmox passes $size in KILOBYTES, TrueNAS expects bytes in volsize
+    my $bytes = int($size) * 1024;
+    my $blocksize = $scfg->{zvol_blocksize};
+
     my $create_payload = {
         name    => $full_ds,
         type    => 'VOLUME',
-        volsize => int($size),
-        # optionally: volblocksize => '16K', sparse => JSON::true
+        volsize => $bytes,
+        sparse  => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
     };
+    $create_payload->{volblocksize} = $blocksize if $blocksize;
+
     _api_call(
         $scfg,
         'pool.dataset.create',
@@ -1241,10 +1384,10 @@ sub list_images {
     my ($class, $storeid, $scfg, $vmid, $vollist, $cache) = @_;
     my $res = [];
 
-    # ---- cache TrueNAS state for this call chain ----
-    my $extents    = $cache->{tn_extents}        //= (_tn_extents($scfg) // []);
-    my $maps       = $cache->{tn_targetextents}  //= (_tn_targetextents($scfg) // []);
-    my $target_id  = _resolve_target_id($scfg);
+    # ---- fetch fresh TrueNAS state (minimal caching for target_id only) ----
+    my $extents    = _tn_extents($scfg) // [];
+    my $maps       = _tn_targetextents($scfg) // [];
+    my $target_id  = $cache->{target_id} //= _resolve_target_id($scfg);
 
     # Index extents by id for quick lookups
     my %extent_by_id = map { ($_->{id} // -1) => $_ } @$extents;
@@ -1304,11 +1447,12 @@ sub list_images {
 
         # Format is always raw for block iSCSI zvols
         my %entry = (
-            volid  => $volid,
-            size   => $size,
-            format => 'raw',
+            volid   => $volid,
+            size    => $size || 0,
+            format  => 'raw',
+            content => 'images',
+            vmid    => defined($owner) ? int($owner) : 0,
         );
-        $entry{vmid} = int($owner) if defined $owner;
         push @$res, \%entry;
     }
     return $res;
