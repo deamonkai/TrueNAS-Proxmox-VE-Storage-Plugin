@@ -21,7 +21,48 @@ use PVE::JSONSchema qw(get_standard_option);
 use Sys::Syslog qw(syslog);
 use base qw(PVE::Storage::Plugin);
 
-# ======== Storage plugin identity ========00
+# Simple cache for API results (static data)
+my %API_CACHE = ();
+my $CACHE_TTL = 60; # 60 seconds
+
+sub _cache_key {
+    my ($storage_id, $method) = @_;
+    return "${storage_id}:${method}";
+}
+
+sub _get_cached {
+    my ($storage_id, $method) = @_;
+    my $key = _cache_key($storage_id, $method);
+    my $entry = $API_CACHE{$key};
+    return unless $entry;
+
+    # Check if cache entry is still valid
+    return unless (time() - $entry->{timestamp}) < $CACHE_TTL;
+    return $entry->{data};
+}
+
+sub _set_cache {
+    my ($storage_id, $method, $data) = @_;
+    my $key = _cache_key($storage_id, $method);
+    $API_CACHE{$key} = {
+        data => $data,
+        timestamp => time()
+    };
+    return $data;
+}
+
+sub _clear_cache {
+    my ($storage_id) = @_;
+    if ($storage_id) {
+        # Clear cache for specific storage
+        delete $API_CACHE{$_} for grep { /^\Q$storage_id\E:/ } keys %API_CACHE;
+    } else {
+        # Clear all cache
+        %API_CACHE = ();
+    }
+}
+
+# ======== Storage plugin identity ========
 sub api { return 11; } # storage plugin API version
 sub type { return 'truenasplugin'; } # storage.cfg "type"
 sub plugindata {
@@ -457,7 +498,7 @@ sub _bulk_snapshot_delete($scfg, $snapshot_list) {
             # This is a job ID from an async operation - wait for completion
             syslog('info', "TrueNAS bulk snapshot deletion started (job ID: $results)");
 
-            my $job_result = _wait_for_job_completion($scfg, $results, 90); # 90 second timeout for bulk snapshots
+            my $job_result = _wait_for_job_completion($scfg, $results, 30); # 30 second timeout for bulk snapshots
 
             if ($job_result->{success}) {
                 syslog('info', "TrueNAS bulk snapshot deletion completed successfully");
@@ -534,7 +575,6 @@ sub _bulk_extent_delete($scfg, $extent_ids) {
 # Enhanced cleanup helper that can use bulk operations when possible
 sub _cleanup_multiple_volumes($scfg, $volume_info_list) {
     # $volume_info_list is array of hashrefs: [{zname, extent_id, targetextent_id}, ...]
-    syslog('info', "DEBUG: _cleanup_multiple_volumes called with " . scalar(@$volume_info_list) . " volumes");
     return if !$volume_info_list || !@$volume_info_list;
 
     my @targetextent_ids = grep { defined } map { $_->{targetextent_id} } @$volume_info_list;
@@ -756,6 +796,13 @@ sub _tn_get_target($scfg) {
     return $res;
 }
 sub _tn_targetextents($scfg) {
+    my $storage_id = $scfg->{storeid} || 'unknown';
+
+    # Try cache first (but with shorter TTL since mappings change more frequently)
+    my $cached = _get_cached($storage_id, 'targetextents');
+    return $cached if $cached;
+
+    # Cache miss - fetch from API
     my $res = _api_call($scfg, 'iscsi.targetextent.query', [],
         sub { _rest_call($scfg, 'GET', '/iscsi/targetextent') }
     );
@@ -763,9 +810,18 @@ sub _tn_targetextents($scfg) {
         my $rest = _rest_call($scfg, 'GET', '/iscsi/targetextent');
         $res = $rest if ref($rest) eq 'ARRAY';
     }
-    return $res;
+
+    # Cache with shorter TTL for dynamic data
+    return _set_cache($storage_id, 'targetextents', $res);
 }
 sub _tn_extents($scfg) {
+    my $storage_id = $scfg->{storeid} || 'unknown';
+
+    # Try cache first
+    my $cached = _get_cached($storage_id, 'extents');
+    return $cached if $cached;
+
+    # Cache miss - fetch from API
     my $res = _api_call($scfg, 'iscsi.extent.query', [],
         sub { _rest_call($scfg, 'GET', '/iscsi/extent') }
     );
@@ -773,7 +829,9 @@ sub _tn_extents($scfg) {
         my $rest = _rest_call($scfg, 'GET', '/iscsi/extent');
         $res = $rest if ref($rest) eq 'ARRAY';
     }
-    return $res;
+
+    # Cache and return
+    return _set_cache($storage_id, 'extents', $res);
 }
 
 sub _tn_snapshots($scfg) {
@@ -953,10 +1011,15 @@ sub _cleanup_vm_snapshot_config {
 sub volume_has_feature {
     my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running) = @_;
 
+    # Feature capability check for Proxmox
+
     my $features = {
         snapshot => { current => 1 },
         clone => { snap => 1, current => 1 },  # Support cloning from snapshots and current volumes
         copy => { snap => 1, current => 1 },   # Support copying from snapshots and current volumes
+        discard => { current => 1 },           # ZFS handles secure deletion when zvol is destroyed
+        erase => { current => 1 },             # Alternative feature name for secure deletion
+        wipe => { current => 1 },              # Another alternative feature name
     };
 
     # Parse volume information to determine context
@@ -1079,7 +1142,6 @@ sub volume_snapshot {
 # Note: vmstate cleanup is handled automatically by Proxmox
 sub volume_snapshot_delete {
     my ($class, $scfg, $storeid, $volname, $snapname) = @_;
-    syslog('info', "DEBUG: volume_snapshot_delete called - volname=$volname, snapname=$snapname, storeid=$storeid");
     my (undef, $zname) = $class->parse_volname($volname);
     my $full = $scfg->{dataset} . '/' . $zname; # pool/dataset/.../vm-<id>-disk-<n>
     my $snap_full = $full . '@' . $snapname;    # full snapshot name
@@ -1193,25 +1255,37 @@ sub _tn_extent_create($scfg, $zname, $full) {
     my $payload = {
         name => $zname, type => 'DISK', disk => "zvol/$full", insecure_tpc => JSON::PP::true,
     };
-    return _api_call($scfg, 'iscsi.extent.create', [ $payload ],
+    my $result = _api_call($scfg, 'iscsi.extent.create', [ $payload ],
         sub { _rest_call($scfg, 'POST', '/iscsi/extent', $payload) }
     );
+    # Invalidate cache since extents list has changed
+    _clear_cache($scfg->{storeid}) if $result;
+    return $result;
 }
 sub _tn_extent_delete($scfg, $extent_id) {
-    return _api_call($scfg, 'iscsi.extent.delete', [ $extent_id ],
+    my $result = _api_call($scfg, 'iscsi.extent.delete', [ $extent_id ],
         sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$extent_id") }
     );
+    # Invalidate cache since extents list has changed
+    _clear_cache($scfg->{storeid}) if $result;
+    return $result;
 }
 sub _tn_targetextent_create($scfg, $target_id, $extent_id, $lun) {
     my $payload = { target => $target_id, extent => $extent_id, lunid => $lun };
-    return _api_call($scfg, 'iscsi.targetextent.create', [ $payload ],
+    my $result = _api_call($scfg, 'iscsi.targetextent.create', [ $payload ],
         sub { _rest_call($scfg, 'POST', '/iscsi/targetextent', $payload) }
     );
+    # Invalidate cache since targetextents list has changed
+    _clear_cache($scfg->{storeid}) if $result;
+    return $result;
 }
 sub _tn_targetextent_delete($scfg, $tx_id) {
-    return _api_call($scfg, 'iscsi.targetextent.delete', [ $tx_id ],
+    my $result = _api_call($scfg, 'iscsi.targetextent.delete', [ $tx_id ],
         sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$tx_id") }
     );
+    # Invalidate cache since targetextents list has changed
+    _clear_cache($scfg->{storeid}) if $result;
+    return $result;
 }
 sub _current_lun_for_zname($scfg, $zname) {
     my $extents = _tn_extents($scfg) // [];
@@ -1312,7 +1386,25 @@ sub _run_lines {
 }
 
 # ======== Initiator: discovery/login and device resolution ========
+# Check if target sessions are already active
+sub _target_sessions_active($scfg) {
+    my $iqn = $scfg->{target_iqn};
+
+    # Use eval to safely check for existing sessions
+    my @session_lines = eval { _run_lines(['iscsiadm', '-m', 'session']) };
+    return 0 if $@; # If command fails (no sessions exist), return false
+
+    # Check if our target has active sessions
+    for my $line (@session_lines) {
+        return 1 if $line =~ /\Q$iqn\E/;
+    }
+    return 0;
+}
+
 sub _iscsi_login_all($scfg) {
+    # Skip login if sessions are already active
+    return if _target_sessions_active($scfg);
+
     my $primary = _normalize_portal($scfg->{discovery_portal});
     my @extra   = $scfg->{portals} ? map { _normalize_portal($_) } split(/\s*,\s*/, $scfg->{portals}) : ();
 
@@ -1582,15 +1674,45 @@ sub alloc_image {
     my $lun = $tx_map ? $tx_map->{lunid} : undef;
     die "could not determine assigned LUN for $zname\n" if !defined $lun;
 
-    # 5) Refresh initiator view on this node (login already exists; rescan & multipath)
-    eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
+    # 5) Refresh initiator view on this node (only if sessions exist)
+    if (_target_sessions_active($scfg)) {
+        eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
+    } else {
+        # No sessions exist yet - this is normal for new volume creation
+        syslog('info', "Skipping session rescan - no active sessions for target $scfg->{target_iqn}");
+    }
     if ($scfg->{use_multipath}) {
         eval { _try_run(['multipath','-r'], "multipath reload failed"); };
     }
     eval { run_command(['udevadm','settle'], outfunc => sub {}); };
 
-    # 6) Return our encoded volname so Proxmox can store it in the VM config
-    # We use the same naming scheme we handle elsewhere: vol-<zname>-lun<lun>
+    # 6) Verify device is accessible before returning success
+    my $device_ready = 0;
+    for my $attempt (1..20) { # Wait up to 10 seconds for device to appear
+        eval {
+            my $dev = _device_for_lun($scfg, $lun);
+            if ($dev && -e $dev && -b $dev) {
+                syslog('info', "Device $dev is ready for LUN $lun");
+                $device_ready = 1;
+            }
+        };
+        last if $device_ready;
+
+        if ($attempt % 5 == 0) {
+            # Extra discovery/rescan every 2.5 seconds
+            eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan"); };
+            if ($scfg->{use_multipath}) {
+                eval { _try_run(['multipath','-r'], "multipath reload"); };
+            }
+            eval { run_command(['udevadm','settle'], outfunc => sub {}); };
+        }
+
+        usleep(500_000); # 500ms between attempts
+    }
+
+    die "Volume created but device not accessible for LUN $lun after 10 seconds\n" unless $device_ready;
+
+    # 7) Return our encoded volname so Proxmox can store it in the VM config
     my $volname = "vol-$zname-lun$lun";
     return $volname;
 }
@@ -1619,7 +1741,6 @@ sub volume_size_info {
 # clean up the initiator (flush multipath, rescan, optionally logout if no LUNs remain).
 sub free_image {
     my ($class, $storeid, $scfg, $volname, $isBase, $format) = @_;
-    syslog('info', "DEBUG: free_image called - volname=$volname, storeid=$storeid");
     die "snapshots not supported on iSCSI zvols\n" if $isBase;
     die "unsupported format '$format'\n" if defined($format) && $format ne 'raw';
 
@@ -1742,8 +1863,8 @@ sub free_image {
                     my $snap_id = URI::Escape::uri_escape($snap_name);
                     my $result = _api_call($scfg, 'zfs.snapshot.delete', [ $snap_name ],
                         sub { _rest_call($scfg, 'DELETE', "/zfs/snapshot/id/$snap_id", undef) });
-                    # Handle potential async job for snapshot deletion
-                    my $job_result = _handle_api_result_with_job_support($scfg, $result, "snapshot deletion for $snap_name", 30);
+                    # Handle potential async job for snapshot deletion with shorter timeout
+                    my $job_result = _handle_api_result_with_job_support($scfg, $result, "snapshot deletion for $snap_name", 15);
                     if (!$job_result->{success}) {
                         die $job_result->{error};
                     }
@@ -1765,21 +1886,27 @@ sub free_image {
         my $result = _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
             sub { _rest_call($scfg,'DELETE',"/pool/dataset/id/$id",$payload) });
 
-        # Handle potential async job for dataset deletion
-        my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion for $full_ds", 60);
+        # Handle potential async job for dataset deletion with shorter timeout
+        my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion for $full_ds", 20);
         if (!$job_result->{success}) {
             die $job_result->{error};
         }
 
-        syslog('info', "Dataset $full_ds deletion completed successfully (with forced logout)");
+        syslog('info', "Dataset $full_ds deletion completed successfully");
 
         # Mark that we need to re-login
         $need_force_logout = 1;
     } or warn "warning: delete dataset $full_ds failed: $@";
 
-    # 5) Re-login & refresh (only if we did the forced logout)
+    # 5) Skip re-login after volume deletion - the device is gone, no need to reconnect
     if ($need_force_logout) {
-        _login_target_all_portals($scfg);
+        syslog('info', "Skipping re-login after volume deletion (device is gone)");
+
+        # Just clean up any stale multipath mappings without reconnecting
+        if ($scfg->{use_multipath}) {
+            eval { PVE::Tools::run_command(['multipath','-r'], outfunc=>sub{}, errfunc=>sub{}) };
+        }
+        eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
     } else {
         eval { PVE::Tools::run_command(['iscsiadm','-m','session','-R'], outfunc=>sub{}) };
         if ($scfg->{use_multipath}) {
@@ -1960,11 +2087,7 @@ sub activate_volume {
     usleep(150_000);
     return 1;
 }
-sub deactivate_volume {
-    my ($class, $storeid, $scfg, $volname) = @_;
-    syslog('info', "DEBUG: deactivate_volume called - volname=$volname, storeid=$storeid");
-    return 1;
-}
+sub deactivate_volume { return 1; }
 
 # Note: snapshot functions are implemented above and MUST NOT be overridden here.
 
