@@ -13,13 +13,15 @@ use Socket qw(inet_ntoa);
 use LWP::UserAgent;
 use HTTP::Request;
 use Cwd qw(abs_path);
+use Sys::Syslog qw(syslog);
 use Carp qw(carp croak);
 use PVE::Tools qw(run_command trim);
 use PVE::Storage::Plugin;
 use PVE::JSONSchema qw(get_standard_option);
+use Sys::Syslog qw(syslog);
 use base qw(PVE::Storage::Plugin);
 
-# ======== Storage plugin identity ========
+# ======== Storage plugin identity ========00
 sub api { return 11; } # storage plugin API version
 sub type { return 'truenasplugin'; } # storage.cfg "type"
 sub plugindata {
@@ -129,6 +131,12 @@ sub properties {
             description => "Storage location for vmstate: 'shared' (TrueNAS iSCSI) or 'local' (node filesystem).",
             type => 'string', optional => 1, default => 'local',
         },
+
+        # Bulk operations for improved performance
+        enable_bulk_operations => {
+            description => "Enable bulk API operations for better performance (requires WebSocket transport).",
+            type => 'boolean', optional => 1, default => 1,
+        },
     };
 }
 sub options {
@@ -175,6 +183,9 @@ sub options {
         enable_live_snapshots => { optional => 1 },
         snapshot_volume_chains => { optional => 1 },
         vmstate_storage => { optional => 1 },
+
+        # Bulk operations
+        enable_bulk_operations => { optional => 1 },
     };
 }
 
@@ -363,15 +374,348 @@ sub _ws_rpc {
     return $decoded->{result};
 }
 
+# ======== Persistent WebSocket Connection Management ========
+my %_ws_connections; # Global connection cache
+
+sub _ws_connection_key($scfg) {
+    # Create a unique key for this storage configuration
+    my $host = $scfg->{api_host};
+    my $key = $scfg->{api_key};
+    my $transport = $scfg->{api_transport} // 'ws';
+    return "$transport:$host:$key";
+}
+
+sub _ws_get_persistent($scfg) {
+    my $key = _ws_connection_key($scfg);
+    my $conn = $_ws_connections{$key};
+
+    # Test if existing connection is still alive
+    if ($conn && $conn->{sock}) {
+        # Quick connection test - try to send a ping
+        eval {
+            # Test with a lightweight method call
+            _ws_rpc($conn, {
+                jsonrpc => "2.0", id => 999999, method => "core.ping", params => [],
+            });
+        };
+        if ($@) {
+            # Connection is dead, remove it
+            delete $_ws_connections{$key};
+            $conn = undef;
+        }
+    }
+
+    # Create new connection if needed
+    if (!$conn) {
+        $conn = _ws_open($scfg);
+        $_ws_connections{$key} = $conn if $conn;
+    }
+
+    return $conn;
+}
+
+sub _ws_cleanup_connections() {
+    # Clean up all stored connections (called during shutdown)
+    for my $key (keys %_ws_connections) {
+        my $conn = $_ws_connections{$key};
+        if ($conn && $conn->{sock}) {
+            eval { $conn->{sock}->close(); };
+        }
+    }
+    %_ws_connections = ();
+}
+
+# ======== Bulk Operations Helper ========
+sub _api_bulk_call($scfg, $method_name, $params_array, $description = undef) {
+    # Use core.bulk to batch multiple calls of the same method
+    # $params_array should be an array of parameter arrays
+
+    # Check if bulk operations are enabled (default: enabled)
+    my $bulk_enabled = $scfg->{enable_bulk_operations} // 1;
+    if (!$bulk_enabled) {
+        die "Bulk operations are disabled in storage configuration";
+    }
+
+    return _api_call($scfg, 'core.bulk', [$method_name, $params_array, $description],
+        sub { die "Bulk operations require WebSocket transport"; });
+}
+
+# Bulk snapshot deletion helper
+sub _bulk_snapshot_delete($scfg, $snapshot_list) {
+    return [] if !$snapshot_list || !@$snapshot_list;
+
+    # Prepare parameter arrays for each snapshot deletion
+    my @params_array = map { [$_] } @$snapshot_list;
+
+    my $results = _api_bulk_call($scfg, 'zfs.snapshot.delete', \@params_array,
+        'Deleting snapshot {0}');
+
+    # Check if results is actually an array reference or a job ID
+    if (!ref($results) || ref($results) ne 'ARRAY') {
+        # Check if we got a numeric job ID (TrueNAS async operation)
+        if (defined $results && $results =~ /^\d+$/) {
+            # This is a job ID from an async operation - wait for completion
+            syslog('info', "TrueNAS bulk snapshot deletion started (job ID: $results)");
+
+            my $job_result = _wait_for_job_completion($scfg, $results, 90); # 90 second timeout for bulk snapshots
+
+            if ($job_result->{success}) {
+                syslog('info', "TrueNAS bulk snapshot deletion completed successfully");
+                return []; # Return empty error list (success)
+            } else {
+                my $error = "Bulk snapshot deletion job failed: " . $job_result->{error};
+                syslog('error', $error);
+                return [$error]; # Return error list
+            }
+        } else {
+            # Unknown response type
+            die "Bulk operation returned unexpected result type: " . (ref($results) || 'scalar') .
+                " (value: " . (defined $results ? $results : 'undef') . "). " .
+                "Try disabling bulk operations by setting enable_bulk_operations=0 in storage config.";
+        }
+    }
+
+    # Process results and collect any errors
+    my @errors;
+    for my $i (0 .. $#{$results}) {
+        my $result = $results->[$i];
+        if ($result->{error}) {
+            push @errors, "Failed to delete $snapshot_list->[$i]: $result->{error}";
+        }
+    }
+
+    return \@errors;
+}
+
+# Bulk iSCSI targetextent deletion helper
+sub _bulk_targetextent_delete($scfg, $targetextent_ids) {
+    return [] if !$targetextent_ids || !@$targetextent_ids;
+
+    # Prepare parameter arrays for each targetextent deletion
+    my @params_array = map { [$_] } @$targetextent_ids;
+
+    my $results = _api_bulk_call($scfg, 'iscsi.targetextent.delete', \@params_array,
+        'Deleting targetextent {0}');
+
+    # Process results and collect any errors
+    my @errors;
+    for my $i (0 .. $#{$results}) {
+        my $result = $results->[$i];
+        if ($result->{error}) {
+            push @errors, "Failed to delete targetextent $targetextent_ids->[$i]: $result->{error}";
+        }
+    }
+
+    return \@errors;
+}
+
+# Bulk iSCSI extent deletion helper
+sub _bulk_extent_delete($scfg, $extent_ids) {
+    return [] if !$extent_ids || !@$extent_ids;
+
+    # Prepare parameter arrays for each extent deletion
+    my @params_array = map { [$_] } @$extent_ids;
+
+    my $results = _api_bulk_call($scfg, 'iscsi.extent.delete', \@params_array,
+        'Deleting extent {0}');
+
+    # Process results and collect any errors
+    my @errors;
+    for my $i (0 .. $#{$results}) {
+        my $result = $results->[$i];
+        if ($result->{error}) {
+            push @errors, "Failed to delete extent $extent_ids->[$i]: $result->{error}";
+        }
+    }
+
+    return \@errors;
+}
+
+# Enhanced cleanup helper that can use bulk operations when possible
+sub _cleanup_multiple_volumes($scfg, $volume_info_list) {
+    # $volume_info_list is array of hashrefs: [{zname, extent_id, targetextent_id}, ...]
+    syslog('info', "DEBUG: _cleanup_multiple_volumes called with " . scalar(@$volume_info_list) . " volumes");
+    return if !$volume_info_list || !@$volume_info_list;
+
+    my @targetextent_ids = grep { defined } map { $_->{targetextent_id} } @$volume_info_list;
+    my @extent_ids = grep { defined } map { $_->{extent_id} } @$volume_info_list;
+    my @dataset_names = grep { defined } map { $_->{zname} } @$volume_info_list;
+
+    my @all_errors;
+    my $bulk_enabled = $scfg->{enable_bulk_operations} // 1;
+
+    # Delete targetextents - use bulk if enabled and multiple items
+    if (@targetextent_ids > 1 && $bulk_enabled) {
+        my $errors = eval { _bulk_targetextent_delete($scfg, \@targetextent_ids) };
+        if ($@) {
+            # Fall back to individual deletion if bulk fails
+            foreach my $id (@targetextent_ids) {
+                eval {
+                    _api_call($scfg, 'iscsi.targetextent.delete', [$id],
+                        sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$id", undef) });
+                };
+                push @all_errors, "Failed to delete targetextent $id: $@" if $@;
+            }
+        } else {
+            push @all_errors, @$errors if $errors && @$errors;
+        }
+    } else {
+        # Individual deletion for single item or when bulk disabled
+        foreach my $id (@targetextent_ids) {
+            eval {
+                _api_call($scfg, 'iscsi.targetextent.delete', [$id],
+                    sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$id", undef) });
+            };
+            push @all_errors, "Failed to delete targetextent $id: $@" if $@;
+        }
+    }
+
+    # Delete extents - use bulk if enabled and multiple items
+    if (@extent_ids > 1 && $bulk_enabled) {
+        my $errors = eval { _bulk_extent_delete($scfg, \@extent_ids) };
+        if ($@) {
+            # Fall back to individual deletion if bulk fails
+            foreach my $id (@extent_ids) {
+                eval {
+                    _api_call($scfg, 'iscsi.extent.delete', [$id],
+                        sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$id", undef) });
+                };
+                push @all_errors, "Failed to delete extent $id: $@" if $@;
+            }
+        } else {
+            push @all_errors, @$errors if $errors && @$errors;
+        }
+    } else {
+        # Individual deletion for single item or when bulk disabled
+        foreach my $id (@extent_ids) {
+            eval {
+                _api_call($scfg, 'iscsi.extent.delete', [$id],
+                    sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$id", undef) });
+            };
+            push @all_errors, "Failed to delete extent $id: $@" if $@;
+        }
+    }
+
+    # Datasets are typically deleted individually since they might have different parameters
+    for my $dataset (@dataset_names) {
+        eval {
+            my $full_ds = $scfg->{dataset} . '/' . $dataset;
+            my $id = URI::Escape::uri_escape($full_ds);
+            my $payload = { recursive => JSON::PP::true, force => JSON::PP::true };
+            _api_call($scfg, 'pool.dataset.delete', [$full_ds, $payload],
+                sub { _rest_call($scfg, 'DELETE', "/pool/dataset/id/$id", $payload) });
+        };
+        push @all_errors, "Failed to delete dataset $dataset: $@" if $@;
+    }
+
+    return \@all_errors;
+}
+
+# Public bulk operations interface for external use (like test scripts)
+sub bulk_delete_snapshots {
+    my ($class, $scfg, $storeid, $volname, $snapshot_names) = @_;
+    return [] if !$snapshot_names || !@$snapshot_names;
+
+    my (undef, $zname) = $class->parse_volname($volname);
+    my $full = $scfg->{dataset} . '/' . $zname;
+
+    # Convert snapshot names to full snapshot names
+    my @full_snapshots = map { "$full\@$_" } @$snapshot_names;
+
+    # Use bulk deletion
+    return _bulk_snapshot_delete($scfg, \@full_snapshots);
+}
+
+# ======== Job completion helper ========
+sub _wait_for_job_completion {
+    my ($scfg, $job_id, $timeout_seconds) = @_;
+
+    $timeout_seconds //= 60; # Default 60 second timeout
+
+    syslog('info', "Waiting for TrueNAS job $job_id to complete (timeout: ${timeout_seconds}s)");
+
+    for my $attempt (1..$timeout_seconds) {
+        # Small delay between checks
+        sleep(1);
+
+        my $job_status;
+        eval {
+            $job_status = _api_call($scfg, 'core.call', ['core.get_jobs', [{ id => int($job_id) }]],
+                                  sub { _rest_call($scfg, 'GET', "/core/get_jobs") });
+        };
+
+        if ($@) {
+            syslog('warning', "Failed to check job status for job $job_id: $@");
+            next; # Continue trying
+        }
+
+        if ($job_status && ref($job_status) eq 'ARRAY' && @$job_status > 0) {
+            my $job = $job_status->[0];
+            my $state = $job->{state} // 'UNKNOWN';
+
+            if ($state eq 'SUCCESS') {
+                syslog('info', "TrueNAS job $job_id completed successfully");
+                return { success => 1 };
+            } elsif ($state eq 'FAILED') {
+                my $error = $job->{error} // $job->{exc_info} // 'Unknown error';
+                syslog('error', "TrueNAS job $job_id failed: $error");
+                return { success => 0, error => $error };
+            } elsif ($state eq 'RUNNING' || $state eq 'WAITING') {
+                # Job still in progress, continue waiting
+                if ($attempt % 10 == 0) { # Log every 10 seconds
+                    syslog('info', "TrueNAS job $job_id still $state (${attempt}s elapsed)");
+                }
+                next;
+            } else {
+                syslog('warning', "TrueNAS job $job_id in unexpected state: $state");
+                next;
+            }
+        } else {
+            syslog('warning', "Could not retrieve status for TrueNAS job $job_id (attempt $attempt)");
+            next;
+        }
+    }
+
+    # Timeout reached
+    syslog('error', "TrueNAS job $job_id timed out after ${timeout_seconds} seconds");
+    return { success => 0, error => "Job timed out after ${timeout_seconds} seconds" };
+}
+
+# Helper function to handle potential async job results
+sub _handle_api_result_with_job_support {
+    my ($scfg, $result, $operation_name, $timeout_seconds) = @_;
+
+    $timeout_seconds //= 60;
+
+    # If result is a job ID (numeric), wait for completion
+    if (defined $result && !ref($result) && $result =~ /^\d+$/) {
+        syslog('info', "TrueNAS $operation_name started (job ID: $result)");
+
+        my $job_result = _wait_for_job_completion($scfg, $result, $timeout_seconds);
+
+        if ($job_result->{success}) {
+            syslog('info', "TrueNAS $operation_name completed successfully");
+            return { success => 1, result => undef };
+        } else {
+            my $error = "TrueNAS $operation_name job failed: " . $job_result->{error};
+            syslog('error', $error);
+            return { success => 0, error => $error };
+        }
+    }
+
+    # For non-job results, return as-is (synchronous operation)
+    return { success => 1, result => $result };
+}
+
 # ======== Transport-agnostic API wrapper ========
 sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
     my $transport = lc($scfg->{api_transport} // 'ws');
     if ($transport eq 'ws') {
         my ($res, $err);
         eval {
-            my $conn = _ws_open($scfg);
+            my $conn = _ws_get_persistent($scfg);
             $res = _ws_rpc($conn, {
-                jsonrpc => "2.0", id => 1, method => $ws_method, params => $ws_params // [],
+                jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
             });
         };
         $err = $@ if $@;
@@ -381,9 +725,9 @@ sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
             warn "TrueNAS rate limit hit, waiting before retry...";
             sleep(2); # Wait 2 seconds for rate limit to reset
             eval {
-                my $conn = _ws_open($scfg);
+                my $conn = _ws_get_persistent($scfg);
                 $res = _ws_rpc($conn, {
-                    jsonrpc => "2.0", id => 1, method => $ws_method, params => $ws_params // [],
+                    jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
                 });
             };
             $err = $@ if $@;
@@ -431,6 +775,18 @@ sub _tn_extents($scfg) {
     }
     return $res;
 }
+
+sub _tn_snapshots($scfg) {
+    my $res = _api_call($scfg, 'zfs.snapshot.query', [],
+        sub { _rest_call($scfg, 'GET', '/zfs/snapshot') }
+    );
+    if (ref($res) eq 'ARRAY' && !@$res) {
+        my $rest = _rest_call($scfg, 'GET', '/zfs/snapshot');
+        $res = $rest if ref($rest) eq 'ARRAY';
+    }
+    return $res;
+}
+
 sub _tn_global($scfg) {
     return _api_call($scfg, 'iscsi.global.config', [],
         sub { _rest_call($scfg, 'GET', '/iscsi/global') }
@@ -453,9 +809,20 @@ sub _tn_dataset_create($scfg, $full, $size_kib, $blocksize) {
 }
 sub _tn_dataset_delete($scfg, $full) {
     my $id = uri_escape($full); # encode '/' as %2F for REST
-    return _api_call($scfg, 'pool.dataset.delete', [ $full, { recursive => JSON::PP::true } ],
+
+    syslog('info', "Deleting dataset $full with recursive=true (via _tn_dataset_delete)");
+    my $result = _api_call($scfg, 'pool.dataset.delete', [ $full, { recursive => JSON::PP::true } ],
         sub { _rest_call($scfg, 'DELETE', "/pool/dataset/id/$id?recursive=true") }
     );
+
+    # Handle potential async job for dataset deletion
+    my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion (helper) for $full", 60);
+    if (!$job_result->{success}) {
+        die $job_result->{error};
+    }
+
+    syslog('info', "Dataset $full deletion completed successfully (via _tn_dataset_delete)");
+    return $job_result->{result};
 }
 sub _tn_dataset_get($scfg, $full) {
     my $id = uri_escape($full);
@@ -469,6 +836,18 @@ sub _tn_dataset_resize($scfg, $full, $new_bytes) {
     my $payload = { volsize => int($new_bytes) }; # grow-only
     return _api_call($scfg, 'pool.dataset.update', [ $full, $payload ],
         sub { _rest_call($scfg, 'PUT', "/pool/dataset/id/$id", $payload) }
+    );
+}
+sub _tn_dataset_clone($scfg, $source_snapshot, $target_dataset) {
+    # Clone a ZFS snapshot to create a new dataset
+    # source_snapshot: pool/dataset@snapshot
+    # target_dataset: pool/new-dataset
+    my $payload = {
+        snapshot => $source_snapshot,
+        dataset_dst => $target_dataset,
+    };
+    return _api_call($scfg, 'zfs.snapshot.clone', [ $payload ],
+        sub { _rest_call($scfg, 'POST', '/zfs/snapshot/clone', $payload) }
     );
 }
 
@@ -574,17 +953,27 @@ sub _cleanup_vm_snapshot_config {
 sub volume_has_feature {
     my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running) = @_;
 
-    if ($feature && $feature eq 'snapshot') {
-        # Always support disk snapshots via ZFS
-        return 1;
+    my $features = {
+        snapshot => { current => 1 },
+        clone => { snap => 1, current => 1 },  # Support cloning from snapshots and current volumes
+        copy => { snap => 1, current => 1 },   # Support copying from snapshots and current volumes
+    };
+
+    # Parse volume information to determine context
+    my ($vtype, $name, $vmid, $basename, $basevmid, $isBase) = eval { $class->parse_volname($volname) };
+
+    my $key = undef;
+    if ($snapname) {
+        $key = 'snap';  # Operation on snapshot
+    } elsif ($isBase) {
+        $key = 'base';  # Operation on base image
+    } else {
+        $key = 'current';  # Operation on current volume
     }
 
-    # Note: vmstate support is determined by the vmstate_storage setting:
-    # - 'shared': vmstate stored as volumes on this storage (current behavior)
-    # - 'local': vmstate stored on local filesystem (better performance)
-    # Proxmox handles vmstate automatically based on storage capabilities
+    my $result = ($features->{$feature} && $features->{$feature}->{$key}) ? 1 : undef;
 
-    return undef; # other features unchanged
+    return $result;
 }
 
 # Grow-only resize of a raw iSCSI-backed zvol, with TrueNAS 80% preflight and initiator rescan.
@@ -690,16 +1079,27 @@ sub volume_snapshot {
 # Note: vmstate cleanup is handled automatically by Proxmox
 sub volume_snapshot_delete {
     my ($class, $scfg, $storeid, $volname, $snapname) = @_;
+    syslog('info', "DEBUG: volume_snapshot_delete called - volname=$volname, snapname=$snapname, storeid=$storeid");
     my (undef, $zname) = $class->parse_volname($volname);
     my $full = $scfg->{dataset} . '/' . $zname; # pool/dataset/.../vm-<id>-disk-<n>
     my $snap_full = $full . '@' . $snapname;    # full snapshot name
     my $id = URI::Escape::uri_escape($snap_full); # '@' must be URL-encoded in path
 
-    # TrueNAS REST: DELETE /zfs/snapshot/id/<pool%2Fds%40snap>
-    _api_call(
+    syslog('info', "Deleting individual snapshot: $snap_full");
+
+    # TrueNAS REST: DELETE /zfs/snapshot/id/<pool%2Fds%40snap> with job completion waiting
+    my $result = _api_call(
         $scfg, 'zfs.snapshot.delete', [ $snap_full ],
         sub { _rest_call($scfg, 'DELETE', "/zfs/snapshot/id/$id", undef) },
     );
+
+    # Handle potential async job for snapshot deletion
+    my $job_result = _handle_api_result_with_job_support($scfg, $result, "individual snapshot deletion for $snap_full", 30);
+    if (!$job_result->{success}) {
+        die $job_result->{error};
+    }
+
+    syslog('info', "Individual snapshot deletion completed successfully: $snap_full");
     return undef;
 }
 
@@ -1081,7 +1481,7 @@ sub parse_volname {
 
 sub path {
     my ($class, $scfg, $volname, $storeid, $snapname) = @_;
-    die "snapshots not supported on raw iSCSI LUNs" if defined $snapname;
+    # Note: snapname is used during clone operations - we support snapshots via ZFS
     my (undef, $zname, undef, undef, undef, undef, undef, $lun) = $class->parse_volname($volname);
     _iscsi_login_all($scfg);
     my $dev;
@@ -1219,6 +1619,7 @@ sub volume_size_info {
 # clean up the initiator (flush multipath, rescan, optionally logout if no LUNs remain).
 sub free_image {
     my ($class, $storeid, $scfg, $volname, $isBase, $format) = @_;
+    syslog('info', "DEBUG: free_image called - volname=$volname, storeid=$storeid");
     die "snapshots not supported on iSCSI zvols\n" if $isBase;
     die "unsupported format '$format'\n" if defined($format) && $format ne 'raw';
 
@@ -1318,12 +1719,62 @@ sub free_image {
         }
     }
 
-    # 4) Delete the zvol dataset (recursive/force as safety)
+    # 4) Ensure disconnection, then delete all snapshots before deleting the zvol dataset
     eval {
+        # Force logout to ensure dataset isn't busy during deletion
+        syslog('info', "Forcing logout before dataset deletion to prevent 'busy' state");
+        _logout_target_all_portals($scfg);
+
+        # Small delay to ensure logout completes
+        sleep(2);
+
+        # First, delete ALL snapshots for this zvol to ensure clean deletion
+        syslog('info', "Searching for and deleting all snapshots of $full_ds before dataset deletion");
+        my $snapshots = _tn_snapshots($scfg) // [];
+        my @volume_snapshots = grep { $_->{name} && $_->{name} =~ /^\Q$full_ds\E@/ } @$snapshots;
+
+        if (@volume_snapshots) {
+            syslog('info', "Found " . scalar(@volume_snapshots) . " snapshots for $full_ds, deleting them first");
+            for my $snap (@volume_snapshots) {
+                my $snap_name = $snap->{name};
+                syslog('info', "Deleting snapshot $snap_name before volume deletion");
+                eval {
+                    my $snap_id = URI::Escape::uri_escape($snap_name);
+                    my $result = _api_call($scfg, 'zfs.snapshot.delete', [ $snap_name ],
+                        sub { _rest_call($scfg, 'DELETE', "/zfs/snapshot/id/$snap_id", undef) });
+                    # Handle potential async job for snapshot deletion
+                    my $job_result = _handle_api_result_with_job_support($scfg, $result, "snapshot deletion for $snap_name", 30);
+                    if (!$job_result->{success}) {
+                        die $job_result->{error};
+                    }
+                    syslog('info', "Successfully deleted snapshot $snap_name");
+                };
+                if ($@) {
+                    syslog('warning', "Failed to delete snapshot $snap_name: $@");
+                }
+            }
+        } else {
+            syslog('info', "No snapshots found for $full_ds");
+        }
+
+        # Now delete the zvol dataset
         my $id = URI::Escape::uri_escape($full_ds);
-        my $payload = { recursive => JSON::PP::true, force => JSON::PP::true };
-        _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
+        my $payload = { recursive => JSON::PP::false, force => JSON::PP::true };
+
+        syslog('info', "Deleting dataset $full_ds (after snapshot cleanup)");
+        my $result = _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
             sub { _rest_call($scfg,'DELETE',"/pool/dataset/id/$id",$payload) });
+
+        # Handle potential async job for dataset deletion
+        my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion for $full_ds", 60);
+        if (!$job_result->{success}) {
+            die $job_result->{error};
+        }
+
+        syslog('info', "Dataset $full_ds deletion completed successfully (with forced logout)");
+
+        # Mark that we need to re-login
+        $need_force_logout = 1;
     } or warn "warning: delete dataset $full_ds failed: $@";
 
     # 5) Re-login & refresh (only if we did the forced logout)
@@ -1502,18 +1953,143 @@ sub deactivate_storage { return 1; }
 
 sub activate_volume {
     my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
-    die "snapshots not supported" if $snapname;
+    # Note: snapname is used for snapshot operations, we support snapshots via ZFS
     _iscsi_login_all($scfg);
     if ($scfg->{use_multipath}) { run_command(['multipath','-r'], outfunc => sub {}); }
     run_command(['udevadm','settle'], outfunc => sub {});
     usleep(150_000);
     return 1;
 }
-sub deactivate_volume { return 1; }
+sub deactivate_volume {
+    my ($class, $storeid, $scfg, $volname) = @_;
+    syslog('info', "DEBUG: deactivate_volume called - volname=$volname, storeid=$storeid");
+    return 1;
+}
 
 # Note: snapshot functions are implemented above and MUST NOT be overridden here.
 
-sub clone_image { die "clone not supported"; }
+sub clone_image {
+    my ($class, $scfg, $storeid, $volname, $vmid, $snapname, $name, $format) = @_;
+
+
+    die "clone not supported without snapshot\n" unless $snapname;
+    die "only raw format is supported\n" if defined($format) && $format ne 'raw';
+
+    # Parse source volume information
+    my (undef, $source_zname) = $class->parse_volname($volname);
+    my $source_full = $scfg->{dataset} . '/' . $source_zname;
+    my $source_snapshot = $source_full . '@' . $snapname;
+
+    # Determine target dataset name
+    my $target_zname = $name;
+    if (!$target_zname) {
+        # Generate automatic name: vm-<vmid>-disk-<n>
+        for (my $n = 0; $n < 1000; $n++) {
+            my $candidate = "vm-$vmid-disk-$n";
+            my $candidate_full = $scfg->{dataset} . '/' . $candidate;
+            my $exists = eval { _tn_dataset_get($scfg, $candidate_full) };
+            if ($@ || !$exists) {
+                $target_zname = $candidate;
+                last;
+            }
+        }
+        die "unable to find free clone name\n" if !$target_zname;
+    }
+
+    my $target_full = $scfg->{dataset} . '/' . $target_zname;
+
+    # 1) Create ZFS clone from snapshot
+    _tn_dataset_clone($scfg, $source_snapshot, $target_full);
+
+    # 2) Create iSCSI extent for the cloned zvol
+    my $zvol_path = 'zvol/' . $target_full;
+
+    # Check if extent with target name already exists
+    my $extents = _tn_extents($scfg) // [];
+    my ($existing_extent) = grep { ($_->{name} // '') eq $target_zname } @$extents;
+
+    my $extent_name = $target_zname;
+    my $extent_id;
+
+    if ($existing_extent) {
+        # If extent exists and points to our zvol, reuse it
+        if (($existing_extent->{disk} // '') eq $zvol_path) {
+            $extent_id = $existing_extent->{id};
+        } else {
+            # Generate unique extent name with timestamp suffix
+            my $timestamp = time();
+            $extent_name = "$target_zname-$timestamp";
+
+            # Double-check the new name doesn't exist
+            my ($conflict) = grep { ($_->{name} // '') eq $extent_name } @$extents;
+            if ($conflict) {
+                # Add random suffix as fallback
+                $extent_name = "$target_zname-$timestamp-" . int(rand(1000));
+            }
+        }
+    }
+
+    # Create extent if we don't have one yet
+    if (!defined $extent_id) {
+        my $extent_payload = {
+            name => $extent_name,
+            type => 'DISK',
+            disk => $zvol_path,
+            insecure_tpc => JSON::PP::true,
+        };
+
+        my $ext = _api_call(
+            $scfg,
+            'iscsi.extent.create',
+            [ $extent_payload ],
+            sub { _rest_call($scfg, 'POST', '/iscsi/extent', $extent_payload) },
+        );
+        $extent_id = ref($ext) eq 'HASH' ? $ext->{id} : $ext;
+    }
+
+    die "failed to create extent for clone $target_zname\n" if !defined $extent_id;
+
+    # 3) Map extent to target
+    my $target_id = _resolve_target_id($scfg);
+    my $tx_payload = { target => $target_id, extent => $extent_id };
+    my $tx = _api_call(
+        $scfg,
+        'iscsi.targetextent.create',
+        [ $tx_payload ],
+        sub { _rest_call($scfg, 'POST', '/iscsi/targetextent', $tx_payload) },
+    );
+
+    # 4) Find assigned LUN
+    my $maps = _tn_targetextents($scfg) // [];
+    my ($tx_map) = grep {
+        (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
+    } @$maps;
+    my $lun = $tx_map ? $tx_map->{lunid} : undef;
+    die "could not determine assigned LUN for clone $target_zname\n" if !defined $lun;
+
+    # 5) Refresh initiator view
+    eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
+    if ($scfg->{use_multipath}) {
+        eval { _try_run(['multipath','-r'], "multipath reload failed"); };
+    }
+    eval { run_command(['udevadm','settle'], outfunc => sub {}); };
+
+    # 6) Return clone volume name
+    my $clone_volname = "vol-$target_zname-lun$lun";
+    return $clone_volname;
+}
+
+sub copy_image {
+    my ($class, $scfg, $storeid, $volname, $vmid, $snapname, $name, $format) = @_;
+
+
+    # For our TrueNAS plugin, copy_image uses the same ZFS clone functionality as clone_image
+    # This provides efficient space-efficient copying via ZFS clone technology
+    # Proxmox calls this method for full clones when the 'copy' feature is supported
+
+    return $class->clone_image($scfg, $storeid, $volname, $vmid, $snapname, $name, $format);
+}
+
 sub create_base { die "base images not supported"; }
 
 1;

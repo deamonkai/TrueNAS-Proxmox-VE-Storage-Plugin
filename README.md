@@ -111,6 +111,7 @@ sudo systemctl restart pveproxy
 | `vmstate_storage` | vmstate storage location | `local` | `local`, `shared` |
 | `enable_live_snapshots` | Enable live snapshots | `1` | `0`, `1` |
 | `snapshot_volume_chains` | Use volume chains for snapshots | `1` | `0`, `1` |
+| `enable_bulk_operations` | Enable bulk API operations for performance | `1` | `0`, `1` |
 
 ## Usage Examples
 
@@ -274,15 +275,60 @@ truenasplugin: your-storage-name
 - **Network ACLs**: Use TrueNAS iSCSI authorized networks
 - **Audit Logging**: Enable comprehensive audit logging
 
-## Limitations
+## Known Limitations
 
-### Current Limitations
+### ⚠️ Critical Workflow Limitations
+
+#### VM Deletion Behavior
+**Important**: Different VM deletion methods have different cleanup behaviors:
+
+**✅ GUI Deletion (Recommended)**:
+- Deleting VMs through the Proxmox web interface properly calls storage plugin cleanup methods
+- Achieves 100% cleanup of both Proxmox volumes and TrueNAS zvols/snapshots
+- **This is the recommended method for production use**
+
+**❌ CLI `qm destroy` Command**:
+- The `qm destroy` command does NOT call storage plugin cleanup methods
+- Leaves orphaned zvols and snapshots on TrueNAS
+- Proxmox removes internal references but TrueNAS storage remains
+
+**Manual Cleanup Required**:
+When using `qm destroy`, you must manually clean up storage:
+```bash
+# After qm destroy, manually free remaining volumes
+pvesm list your-storage-name | grep vm-ID
+pvesm free your-storage-name:vol-vm-ID-disk-N-lunX
+```
+
+**Production Recommendation**: Use the Proxmox GUI for VM deletion, or implement cleanup procedures when using CLI automation.
+
+#### Fast Clone Limitation
+**VM cloning does not use instant ZFS clones**. Instead, Proxmox performs network-based copying using `qemu-img convert`.
+
+**Why this happens:**
+- Proxmox treats storage plugins that return block device paths (like iSCSI) as "generic block storage"
+- For such storage, Proxmox bypasses storage plugin clone methods and uses `qemu-img convert` directly
+- Our efficient `clone_image` and `copy_image` methods are never called during VM cloning operations
+
+**Performance impact:**
+- Clone operations transfer data over the network at your connection speed (e.g., 1GbE = ~100MB/s)
+- Large VMs (32GB+) can take significant time to clone
+- Network bandwidth is consumed during cloning
+
+**Workaround:**
+- Use smaller base images/templates for frequent cloning
+- Ensure adequate network bandwidth between Proxmox and TrueNAS
+- ZFS snapshots within TrueNAS are still instant and space-efficient
+
+### Other Current Limitations
 - **Shrink Operations**: Volume shrinking is not supported (ZFS limitation)
 - **Live Migration**: Requires shared storage configuration
 - **Backup Integration**: Snapshots are not included in Proxmox backups
 
 ### TrueNAS Specific
-- **API Rate Limits**: Automatic retry implemented for rate limiting
+- **API Rate Limits**: TrueNAS limits API requests to 20 calls per 60 seconds with a 10-minute cooldown when exceeded. Automatic retry with backoff is implemented. During heavy operations or testing, you may see harmless rate limit messages.
+- **Persistent Connections**: WebSocket connections are cached and reused to minimize authentication overhead and reduce API calls
+- **Bulk Operations**: When `enable_bulk_operations=1`, multiple operations of the same type are batched using TrueNAS core.bulk API for improved performance
 - **WebSocket Stability**: REST fallback available for unreliable WebSocket connections
 - **Version Compatibility**: Some features require TrueNAS SCALE 25.04+
 
