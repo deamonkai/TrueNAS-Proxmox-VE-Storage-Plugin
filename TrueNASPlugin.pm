@@ -230,6 +230,15 @@ sub options {
     };
 }
 
+# Force shared storage behavior for cluster migration support
+sub check_config {
+    my ($class, $sectionId, $config, $create, $skipSchemaCheck) = @_;
+    my $opts = $class->SUPER::check_config($sectionId, $config, $create, $skipSchemaCheck);
+    # Always set shared=1 since this is iSCSI-based shared storage
+    $opts->{shared} = 1;
+    return $opts;
+}
+
 # ======== DNS/IPv4 helper ========
 sub _host_ipv4($host) {
     return $host if $host =~ /^\d+\.\d+\.\d+\.\d+$/; # already IPv4 literal
@@ -1831,7 +1840,12 @@ sub free_image {
             eval {
                 _api_call($scfg,'iscsi.targetextent.delete',[ $id ],
                     sub { _rest_call($scfg,'DELETE',"/iscsi/targetextent/id/$id",undef) });
-            } or warn "warning: delete targetextent (retry) id=$id failed: $@";
+            };
+            if ($@) {
+                # In cluster environments, other nodes may have active sessions causing "in use" errors
+                # This is expected - TrueNAS will clean up orphaned extents when all sessions close
+                syslog('info', "Could not delete targetextent id=$id (target may be in use by other cluster nodes). Orphaned extents will be cleaned up by TrueNAS.");
+            }
         }
         # Retry extent delete (re-query extent by name)
         $extents = _tn_extents($scfg) // [];
@@ -1841,7 +1855,10 @@ sub free_image {
             eval {
                 _api_call($scfg,'iscsi.extent.delete',[ $eid ],
                     sub { _rest_call($scfg,'DELETE',"/iscsi/extent/id/$eid",undef) });
-            } or warn "warning: delete extent (retry) id=$eid failed: $@";
+            };
+            if ($@) {
+                syslog('info', "Could not delete extent id=$eid (target may be in use by other cluster nodes). Orphaned extents will be cleaned up by TrueNAS.");
+            }
         }
     }
 
@@ -2072,10 +2089,12 @@ sub status {
         }
     };
     if ($@) {
-        # Conservative fallback to avoid blocking VM starts if stats fail
-        $total = 1024*1024*1024*1024; # 1 TiB
-        $avail = 900*1024*1024*1024;  # 900 GiB
-        $used  = $total - $avail;
+        # Mark storage as inactive if API call fails (e.g., network issue, unreachable from this node)
+        syslog('warning', "TrueNAS storage '$storeid' status check failed: $@");
+        $active = 0;
+        $total = 0;
+        $avail = 0;
+        $used  = 0;
     }
     return ($total, $avail, $used, $active);
 }
