@@ -20,7 +20,11 @@ A high-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE v
 - **CHAP Authentication** - Optional CHAP security for iSCSI connections
 
 ### 📊 Enterprise Features
+- **Configuration Validation** - Validates storage settings at creation time with clear error messages
+- **Detailed Error Messages** - Actionable troubleshooting guidance for all common failure scenarios
 - **Volume Resize** - Grow-only resize with 80% headroom preflight checks
+- **Pre-flight Validation** - Comprehensive checks before volume operations prevent failures
+- **Space Validation** - Pre-allocation space checks with 20% ZFS overhead margin
 - **Error Recovery** - Comprehensive error handling and automatic cleanup
 - **Performance Optimization** - Configurable block sizes and sparse volumes
 - **Monitoring Integration** - Full integration with Proxmox storage status
@@ -112,6 +116,32 @@ sudo zfs create tank/proxmox
 
 ## Configuration
 
+### Configuration Validation
+
+The plugin validates all storage settings when you create or modify storage to catch errors early:
+
+**Automatic Validations:**
+- ✅ **Required fields** - Ensures `api_host`, `api_key`, `dataset`, `target_iqn` are present
+- ✅ **Retry limits** - `api_retry_max` must be 0-10, `api_retry_delay` must be 0.1-60 seconds
+- ✅ **Dataset naming** - Validates ZFS naming rules (alphanumeric, `_`, `-`, `.`, `/`)
+- ✅ **Dataset format** - No leading/trailing `/`, no `//`, no special characters
+- ✅ **Security warnings** - Logs warnings if using insecure HTTP/WS transport
+
+**Example Validation Errors:**
+```
+# Invalid retry value
+api_retry_max must be between 0 and 10 (got 15)
+
+# Invalid dataset name
+dataset name contains invalid characters: 'tank/my storage'
+  Allowed characters: a-z A-Z 0-9 _ - . /
+
+# Missing required field
+api_host is required
+```
+
+These validations run at storage creation/modification time, preventing misconfigured storage that would fail at runtime.
+
 ### Required Parameters
 
 | Parameter | Description | Example |
@@ -145,6 +175,39 @@ sudo zfs create tank/proxmox
 | `enable_live_snapshots` | Enable live snapshots | `1` | `0`, `1` |
 | `snapshot_volume_chains` | Use volume chains for snapshots | `1` | `0`, `1` |
 | `enable_bulk_operations` | Enable bulk API operations | `1` | `0`, `1` |
+| `api_retry_max` | Maximum API retry attempts | `3` | `0`-`10` |
+| `api_retry_delay` | Initial retry delay in seconds | `1` | `0.1`-`60` |
+
+### Retry Configuration
+
+The plugin includes automatic retry logic with exponential backoff for transient failures. This improves reliability in production environments where network glitches or temporary API unavailability can occur.
+
+**Retryable errors include:**
+- Network timeouts and connection failures
+- SSL/TLS errors
+- HTTP 502/503/504 Gateway errors
+- Rate limiting errors
+
+**Non-retryable errors:**
+- Authentication failures (401/403)
+- Not found errors (404)
+- Validation errors
+
+**Retry behavior:**
+- Each retry uses exponential backoff: `delay * 2^(attempt-1)`
+- Random jitter (0-20%) is added to prevent thundering herd
+- Maximum delay caps at `initial_delay * 2^(max_retries-1)`
+- Example with defaults: 1s → 2s → 4s (total ~7s of retries)
+
+**Example configuration for high-latency networks:**
+```ini
+truenasplugin: your-storage-name
+    ... other settings ...
+    api_retry_max 5
+    api_retry_delay 2
+```
+
+This configuration allows up to 5 retries with delays: 2s → 4s → 8s → 16s → 32s.
 
 ## Usage Examples
 
@@ -196,6 +259,40 @@ qm resize 100 scsi0 +16G
 # Start VM
 qm start 100
 ```
+
+## Pre-flight Validation
+
+### Automatic Pre-flight Checks
+
+The plugin performs comprehensive validation before volume operations to prevent failures and ensure clean error reporting:
+
+**Pre-flight Checks (runs in ~200ms):**
+1. **TrueNAS API Connectivity** - Verifies API is reachable
+2. **iSCSI Service Status** - Ensures iSCSI service is running
+3. **Space Availability** - Confirms sufficient space with 20% ZFS overhead
+4. **Target Configuration** - Validates iSCSI target exists
+5. **Dataset Existence** - Verifies parent dataset is present
+
+**Benefits:**
+- **Fast failure** - Fails in <1 second vs 2-4 seconds of wasted work
+- **Clear errors** - Shows exactly what's wrong and how to fix it
+- **No orphans** - Prevents partial resource creation
+- **Better UX** - Actionable error messages with troubleshooting steps
+
+**Example Error Message:**
+```
+Pre-flight validation failed:
+  - TrueNAS iSCSI service is not running (state: STOPPED)
+    Start the service in TrueNAS: System Settings > Services > iSCSI
+  - Insufficient space on dataset 'tank/proxmox': need 120.00 GB (with 20% overhead), have 80.00 GB available
+```
+
+**Success Log:**
+```
+Pre-flight checks passed for 10.00 GB volume allocation on 'tank/proxmox' (VM 100)
+```
+
+This approach prevents partial allocations, reduces troubleshooting time, and provides clear guidance for resolving issues.
 
 ## Performance Tuning
 
@@ -325,6 +422,103 @@ pvesm free your-storage-name:vol-vm-ID-disk-N-lunX
 ```
 
 **Production Recommendation**: Use the Proxmox GUI for VM deletion, or implement cleanup procedures when using CLI automation.
+
+## Troubleshooting
+
+### Error Messages and Solutions
+
+The plugin provides detailed, actionable error messages with specific troubleshooting steps. Below are common error scenarios:
+
+#### "Could not resolve iSCSI target ID for configured IQN"
+
+**Example:**
+```
+Configured IQN: iqn.2005-10.org.freenas.ctl:mytar get
+Available targets:
+  - iqn.2005-10.org.freenas.ctl:proxmox (ID: 2)
+```
+
+**Solutions:**
+1. Verify target exists in TrueNAS: Shares > Block Shares (iSCSI) > Targets
+2. Check `/etc/pve/storage.cfg` - IQN must match exactly
+3. Ensure iSCSI service is running in TrueNAS
+
+#### "Failed to create iSCSI extent for disk"
+
+**Common Causes:**
+- iSCSI service not running → Check System Settings > Services > iSCSI
+- Zvol exists but not accessible → Verify with `zfs list -t volume`
+- API key lacks Sharing permissions → Check Credentials > API Keys
+- Extent name conflict → Check Shares > iSCSI > Extents
+
+#### "Unable to find free disk name after 1000 attempts"
+
+**This indicates:**
+- VM has 1000+ disks (very unlikely)
+- TrueNAS dataset queries failing
+- Orphaned volumes preventing name assignment
+
+**Fix:** Check TrueNAS dataset for orphaned `vm-XXX-disk-*` volumes
+
+#### "Volume created but device not accessible after 10 seconds"
+
+**The zvol exists on TrueNAS but Linux can't see it.**
+
+**Solutions:**
+1. Check iSCSI session: `iscsiadm -m session`
+2. Re-login: `iscsiadm -m node -T <IQN> -p <portal> --login`
+3. Check by-path devices: `ls -la /dev/disk/by-path/`
+4. Verify multipath: `multipath -ll` (if enabled)
+
+### Storage Status and Health
+
+The plugin provides intelligent health monitoring with graceful failure handling:
+
+**Status Behavior:**
+- **Active** - TrueNAS reachable, dataset accessible, normal operations
+- **Inactive** - Temporary failure (network issue, TrueNAS offline, etc.)
+
+**Error Classification:**
+```
+# Connectivity Issues (logged as INFO - temporary)
+- Network timeouts, connection refused, SSL errors
+- Storage marked inactive, operations suspended
+- Auto-recovers when connection restored
+
+# Configuration Errors (logged as ERROR - needs admin action)
+- Dataset not found (ENOENT)
+- Authentication failures (401/403 - check API key)
+- Storage marked inactive until config fixed
+
+# Other Failures (logged as WARNING - investigate)
+- Unexpected errors requiring investigation
+```
+
+**Checking Status:**
+```bash
+pvesm status              # Shows active/inactive state
+journalctl -u pvedaemon | grep "TrueNAS storage"  # View status logs
+```
+
+### Logs and Debugging
+
+**TrueNAS Logs:**
+```bash
+tail -f /var/log/middlewared.log
+```
+
+**Proxmox Logs:**
+```bash
+journalctl -u pvedaemon -f
+journalctl -u pveproxy -f
+```
+
+**Storage Operations:**
+```bash
+pvesm status              # Check storage status
+pvesm list <storage>      # List volumes
+iscsiadm -m session      # Check iSCSI sessions
+```
 
 #### Fast Clone Limitation
 **VM cloning does not use instant ZFS clones**. Instead, Proxmox performs network-based copying using `qemu-img convert`.

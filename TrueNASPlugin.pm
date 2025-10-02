@@ -62,6 +62,96 @@ sub _clear_cache {
     }
 }
 
+# ======== Helper functions ========
+sub _format_bytes {
+    my ($bytes) = @_;
+    return '0 B' if !defined $bytes || $bytes == 0;
+
+    my @units = qw(B KB MB GB TB PB);
+    my $unit_idx = 0;
+    my $size = $bytes;
+
+    while ($size >= 1024 && $unit_idx < $#units) {
+        $size /= 1024;
+        $unit_idx++;
+    }
+
+    return sprintf("%.2f %s", $size, $units[$unit_idx]);
+}
+
+# ======== Retry logic with exponential backoff ========
+sub _is_retryable_error {
+    my ($error) = @_;
+    return 0 if !defined $error;
+
+    # Retry on network errors, timeouts, connection issues
+    return 1 if $error =~ /timeout|timed out/i;
+    return 1 if $error =~ /connection refused|connection reset|broken pipe/i;
+    return 1 if $error =~ /network is unreachable|host is unreachable/i;
+    return 1 if $error =~ /temporary failure|service unavailable/i;
+    return 1 if $error =~ /502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout/i;
+    return 1 if $error =~ /rate limit/i;
+    return 1 if $error =~ /ssl.*error/i; # Transient SSL errors
+    return 1 if $error =~ /connection.*failed/i;
+
+    # Do NOT retry on authentication errors, not found, or validation errors
+    return 0 if $error =~ /401 Unauthorized|403 Forbidden|404 Not Found/i;
+    return 0 if $error =~ /ENOENT|InstanceNotFound|does not exist/i;
+    return 0 if $error =~ /invalid.*key|authentication.*failed/i;
+    return 0 if $error =~ /validation.*error|invalid.*parameter/i;
+    return 0 if $error =~ /EINVAL|Invalid params/i;
+
+    return 0; # Default: don't retry unknown errors
+}
+
+sub _retry_with_backoff {
+    my ($scfg, $operation_name, $code_ref) = @_;
+
+    my $max_retries = $scfg->{api_retry_max} // 3;
+    my $initial_delay = $scfg->{api_retry_delay} // 1;
+
+    my $attempt = 0;
+    my $last_error;
+    my $result;
+
+    while ($attempt <= $max_retries) {
+        $result = eval {
+            return $code_ref->();
+        };
+
+        $last_error = $@;
+
+        # Success - no error, return the result
+        return $result if !$last_error;
+
+        $attempt++;
+
+        # Check if error is retryable
+        if (!_is_retryable_error($last_error)) {
+            syslog('debug', "Non-retryable error for $operation_name: $last_error");
+            die $last_error; # Not retryable, fail immediately
+        }
+
+        # Max retries exhausted
+        if ($attempt > $max_retries) {
+            syslog('error', "Max retries ($max_retries) exhausted for $operation_name: $last_error");
+            die "Operation failed after $max_retries retries: $last_error";
+        }
+
+        # Calculate delay with exponential backoff
+        my $delay = $initial_delay * (2 ** ($attempt - 1));
+        # Add jitter (0-20% random variation) to prevent thundering herd
+        my $jitter = $delay * 0.2 * rand();
+        $delay += $jitter;
+
+        syslog('info', "Retry attempt $attempt/$max_retries for $operation_name after ${delay}s delay (error: $last_error)");
+        sleep($delay);
+    }
+
+    # Should never reach here, but just in case
+    die $last_error;
+}
+
 # ======== Storage plugin identity ========
 sub api { return 11; } # storage plugin API version
 sub type { return 'truenasplugin'; } # storage.cfg "type"
@@ -178,6 +268,16 @@ sub properties {
             description => "Enable bulk API operations for better performance (requires WebSocket transport).",
             type => 'boolean', optional => 1, default => 1,
         },
+
+        # Retry configuration
+        api_retry_max => {
+            description => "Maximum number of API call retries on transient failures.",
+            type => 'integer', optional => 1, default => 3,
+        },
+        api_retry_delay => {
+            description => "Initial retry delay in seconds (doubles with each retry).",
+            type => 'number', optional => 1, default => 1,
+        },
     };
 }
 sub options {
@@ -227,6 +327,10 @@ sub options {
 
         # Bulk operations
         enable_bulk_operations => { optional => 1 },
+
+        # Retry configuration
+        api_retry_max => { optional => 1 },
+        api_retry_delay => { optional => 1 },
     };
 }
 
@@ -234,8 +338,80 @@ sub options {
 sub check_config {
     my ($class, $sectionId, $config, $create, $skipSchemaCheck) = @_;
     my $opts = $class->SUPER::check_config($sectionId, $config, $create, $skipSchemaCheck);
+
     # Always set shared=1 since this is iSCSI-based shared storage
     $opts->{shared} = 1;
+
+    # Validate retry configuration parameters
+    if (defined $opts->{api_retry_max}) {
+        die "api_retry_max must be between 0 and 10 (got $opts->{api_retry_max})\n"
+            if $opts->{api_retry_max} < 0 || $opts->{api_retry_max} > 10;
+    }
+    if (defined $opts->{api_retry_delay}) {
+        die "api_retry_delay must be between 0.1 and 60 seconds (got $opts->{api_retry_delay})\n"
+            if $opts->{api_retry_delay} < 0.1 || $opts->{api_retry_delay} > 60;
+    }
+
+    # Validate dataset name follows ZFS naming conventions
+    if ($opts->{dataset}) {
+        # ZFS datasets: alphanumeric, underscore, hyphen, period, slash (for hierarchy)
+        if ($opts->{dataset} =~ /[^a-zA-Z0-9_\-\.\/]/) {
+            die "dataset name contains invalid characters: '$opts->{dataset}'\n" .
+                "  Allowed characters: a-z A-Z 0-9 _ - . /\n";
+        }
+
+        # Must not start or end with slash
+        if ($opts->{dataset} =~ /^\/|\/$/) {
+            die "dataset name must not start or end with '/': '$opts->{dataset}'\n";
+        }
+
+        # Must not contain double slashes
+        if ($opts->{dataset} =~ /\/\//) {
+            die "dataset name must not contain '//': '$opts->{dataset}'\n";
+        }
+
+        # Must not be empty after trimming
+        if ($opts->{dataset} eq '') {
+            die "dataset name cannot be empty\n";
+        }
+    }
+
+    # Warn if using insecure transport (HTTP/WS instead of HTTPS/WSS)
+    if (defined $opts->{api_transport}) {
+        my $transport = lc($opts->{api_transport});
+        if ($transport eq 'rest' && defined $opts->{api_scheme}) {
+            my $scheme = lc($opts->{api_scheme});
+            if ($scheme eq 'http') {
+                syslog('warning',
+                    "Storage '$sectionId' is using insecure HTTP transport. " .
+                    "Consider using HTTPS for API communication."
+                );
+            }
+        } elsif ($transport eq 'ws') {
+            # WebSocket uses wss:// or ws:// - check if scheme is insecure
+            if (defined $opts->{api_scheme} && lc($opts->{api_scheme}) eq 'ws') {
+                syslog('warning',
+                    "Storage '$sectionId' is using insecure WebSocket (ws://). " .
+                    "Consider using secure WebSocket (wss://) for API communication."
+                );
+            }
+        }
+    }
+
+    # Validate required fields are present
+    if (!$opts->{api_host}) {
+        die "api_host is required\n";
+    }
+    if (!$opts->{api_key}) {
+        die "api_key is required\n";
+    }
+    if (!$opts->{dataset}) {
+        die "dataset is required\n";
+    }
+    if (!$opts->{target_iqn}) {
+        die "target_iqn is required\n";
+    }
+
     return $opts;
 }
 
@@ -268,17 +444,19 @@ sub _rest_base($scfg) {
     return "$scheme://$scfg->{api_host}:$port/api/v2.0";
 }
 sub _rest_call($scfg, $method, $path, $payload=undef) {
-    my $ua  = _ua($scfg);
-    my $url = _rest_base($scfg) . $path;
-    my $req = HTTP::Request->new(uc($method) => $url);
-    $req->header('Authorization' => "Bearer $scfg->{api_key}");
-    $req->header('Content-Type'  => 'application/json');
-    $req->content(encode_json($payload)) if defined $payload;
-    my $res = $ua->request($req);
-    die "TrueNAS REST $method $path failed: ".$res->status_line."\nBody: ".$res->decoded_content."\n"
-        if !$res->is_success;
-    my $content = $res->decoded_content // '';
-    return length($content) ? decode_json($content) : undef;
+    return _retry_with_backoff($scfg, "REST $method $path", sub {
+        my $ua  = _ua($scfg);
+        my $url = _rest_base($scfg) . $path;
+        my $req = HTTP::Request->new(uc($method) => $url);
+        $req->header('Authorization' => "Bearer $scfg->{api_key}");
+        $req->header('Content-Type'  => 'application/json');
+        $req->content(encode_json($payload)) if defined $payload;
+        my $res = $ua->request($req);
+        die "TrueNAS REST $method $path failed: ".$res->status_line."\nBody: ".$res->decoded_content."\n"
+            if !$res->is_success;
+        my $content = $res->decoded_content // '';
+        return length($content) ? decode_json($content) : undef;
+    });
 }
 
 # ======== WebSocket JSON-RPC client ========
@@ -760,31 +938,14 @@ sub _handle_api_result_with_job_support {
 sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
     my $transport = lc($scfg->{api_transport} // 'ws');
     if ($transport eq 'ws') {
-        my ($res, $err);
-        eval {
+        # Wrap WebSocket call with retry logic
+        return _retry_with_backoff($scfg, "WS $ws_method", sub {
             my $conn = _ws_get_persistent($scfg);
-            $res = _ws_rpc($conn, {
+            my $res = _ws_rpc($conn, {
                 jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
             });
-        };
-        $err = $@ if $@;
-
-        # Handle rate limiting with retry
-        if ($err && $err =~ /Rate Limit Exceeded/) {
-            warn "TrueNAS rate limit hit, waiting before retry...";
-            sleep(2); # Wait 2 seconds for rate limit to reset
-            eval {
-                my $conn = _ws_get_persistent($scfg);
-                $res = _ws_rpc($conn, {
-                    jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
-                });
-            };
-            $err = $@ if $@;
-        }
-
-        return $res if !$err;
-        return $rest_fallback->() if $rest_fallback;
-        die $err;
+            return $res;
+        });
     } elsif ($transport eq 'rest') {
         return $rest_fallback->() if $rest_fallback;
         die "REST fallback not provided for $ws_method";
@@ -1309,6 +1470,107 @@ sub _current_lun_for_zname($scfg, $zname) {
     return defined($tx) ? $tx->{lunid} : undef;
 }
 
+# Pre-flight validation checks before volume allocation
+# Returns arrayref of error messages (empty if all checks pass)
+sub _preflight_check_alloc {
+    my ($scfg, $size_kb) = @_;
+
+    my @errors;
+
+    # Check 1: TrueNAS API is reachable
+    eval {
+        _api_call($scfg, 'core.ping', [],
+            sub { _rest_call($scfg, 'GET', '/core/ping') });
+    };
+    if ($@) {
+        push @errors, "TrueNAS API is unreachable: $@";
+    }
+
+    # Check 2: iSCSI service is running
+    eval {
+        my $services = _api_call($scfg, 'service.query',
+            [[ ["service", "=", "iscsitarget"] ]],
+            sub { _rest_call($scfg, 'GET', '/service?service=iscsitarget') });
+
+        if (!$services || !@$services) {
+            push @errors, "Unable to query iSCSI service status";
+        } elsif ($services->[0]->{state} ne 'RUNNING') {
+            push @errors, sprintf(
+                "TrueNAS iSCSI service is not running (state: %s)\n" .
+                "  Start the service in TrueNAS: System Settings > Services > iSCSI",
+                $services->[0]->{state} // 'UNKNOWN'
+            );
+        }
+    };
+    if ($@) {
+        push @errors, "Cannot verify iSCSI service status: $@";
+    }
+
+    # Check 3: Sufficient space available (with 20% overhead)
+    if (defined $size_kb) {
+        my $bytes = int($size_kb) * 1024;
+        my $required = $bytes * 1.2;
+
+        eval {
+            my $ds_info = _tn_dataset_get($scfg, $scfg->{dataset});
+            if ($ds_info) {
+                my $norm = sub {
+                    my ($v) = @_;
+                    return 0 if !defined $v;
+                    return $v if !ref($v);
+                    return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
+                    return 0;
+                };
+                my $available = $norm->($ds_info->{available}) || 0;
+
+                if ($available < $required) {
+                    push @errors, sprintf(
+                        "Insufficient space on dataset '%s': need %s (with 20%% overhead), have %s available",
+                        $scfg->{dataset},
+                        _format_bytes($required),
+                        _format_bytes($available)
+                    );
+                }
+            }
+        };
+        if ($@) {
+            push @errors, "Cannot verify available space: $@";
+        }
+    }
+
+    # Check 4: iSCSI target exists and is configured
+    eval {
+        my $target_id = _resolve_target_id($scfg);
+        if (!defined $target_id) {
+            push @errors, sprintf(
+                "iSCSI target not found: %s\n" .
+                "  Verify target exists in TrueNAS: Shares > Block Shares (iSCSI) > Targets",
+                $scfg->{target_iqn}
+            );
+        }
+    };
+    if ($@) {
+        push @errors, "Cannot verify iSCSI target: $@";
+    }
+
+    # Check 5: Parent dataset exists
+    eval {
+        my $ds = _tn_dataset_get($scfg, $scfg->{dataset});
+        if (!$ds) {
+            push @errors, sprintf(
+                "Parent dataset does not exist: %s\n" .
+                "  Create the dataset in TrueNAS: Storage > Pools",
+                $scfg->{dataset}
+            );
+        }
+    };
+    if ($@) {
+        push @errors, "Cannot verify parent dataset: $@";
+    }
+
+    return \@errors;
+}
+
 # Robustly resolve the TrueNAS target id for a configured fully-qualified IQN.
 sub _resolve_target_id {
     my ($scfg) = @_;
@@ -1350,8 +1612,37 @@ sub _resolve_target_id {
         if ($full && $full eq $want) { $found = $t; last; }
         if ($name && $want =~ /:\Q$name\E$/) { $found = $t; last; }
     }
-    die "could not resolve target id for IQN $want (saw ".scalar(@$targets)." target(s))\n"
-        if !$found;
+    if (!$found) {
+        my @available_iqns = map {
+            my $name = $_->{name} // 'unnamed';
+            my $iqn = $_->{iqn} // ($basename ? "$basename:$name" : $name);
+            "  - $iqn (ID: $_->{id})";
+        } @$targets;
+
+        die sprintf(
+            "Could not resolve iSCSI target ID for configured IQN\n\n" .
+            "Configured IQN: %s\n" .
+            "TrueNAS base name: %s\n" .
+            "Targets found: %d\n\n" .
+            "Available targets:\n%s\n\n" .
+            "Troubleshooting steps:\n" .
+            "  1. Verify target exists in TrueNAS:\n" .
+            "     -> GUI: Shares > Block Shares (iSCSI) > Targets\n" .
+            "  2. Check target_iqn in storage config matches exactly:\n" .
+            "     -> File: /etc/pve/storage.cfg\n" .
+            "     -> Current: target_iqn %s\n" .
+            "  3. Ensure iSCSI service is running:\n" .
+            "     -> GUI: System Settings > Services > iSCSI\n" .
+            "  4. Verify API key has 'Sharing' read permissions:\n" .
+            "     -> GUI: Credentials > API Keys\n\n" .
+            "Note: IQN format is typically: iqn.YYYY-MM.tld.domain:identifier\n",
+            $want,
+            $basename || '(not set)',
+            scalar(@$targets),
+            (@available_iqns ? join("\n", @available_iqns) : "  (none)"),
+            $want
+        );
+    }
     return $found->{id};
 }
 
@@ -1608,6 +1899,21 @@ sub alloc_image {
     die "only raw is supported\n" if defined($fmt) && $fmt ne 'raw';
     die "invalid size\n" if !defined($size) || $size <= 0;
 
+    # Pre-flight checks: validate all prerequisites before expensive operations
+    my $errors = _preflight_check_alloc($scfg, $size);
+    if (@$errors) {
+        my $error_msg = "Pre-flight validation failed:\n  - " . join("\n  - ", @$errors);
+        syslog('error', "alloc_image pre-flight check failed for VM $vmid: " . join("; ", @$errors));
+        die "$error_msg\n";
+    }
+
+    # Log successful pre-flight checks
+    my $bytes = int($size) * 1024; # Proxmox passes size in KiB
+    syslog('info', sprintf(
+        "Pre-flight checks passed for %s volume allocation on '%s' (VM %d)",
+        _format_bytes($bytes), $scfg->{dataset}, $vmid
+    ));
+
     # Determine a disk name under our dataset: vm-<vmid>-disk-<n>
     my $zname = $name;
     if (!$zname) {
@@ -1618,14 +1924,28 @@ sub alloc_image {
             my $exists = eval { _tn_dataset_get($scfg, $full) };
             if ($@ || !$exists) { $zname = $candidate; last; }
         }
-        die "unable to find free disk name\n" if !$zname;
+        if (!$zname) {
+            die sprintf(
+                "Unable to find free disk name after 1000 attempts (VM %d)\n\n" .
+                "This usually indicates:\n" .
+                "  1. Too many disks already exist for this VM (max: 1000)\n" .
+                "  2. TrueNAS dataset query failures preventing name verification\n" .
+                "  3. Naming conflicts with existing volumes\n\n" .
+                "Dataset: %s\n" .
+                "Pattern attempted: vm-%d-disk-0 through vm-%d-disk-999\n\n" .
+                "Troubleshooting:\n" .
+                "  - Check TrueNAS dataset '%s' for orphaned volumes\n" .
+                "  - Verify API connectivity and permissions\n" .
+                "  - Check TrueNAS logs: /var/log/middlewared.log\n",
+                $vmid, $scfg->{dataset}, $vmid, $vmid, $scfg->{dataset}
+            );
+        }
     }
 
     my $full_ds = $scfg->{dataset} . '/' . $zname;
 
     # 1) Create the zvol (VOLUME) on TrueNAS with requested size
-    # Proxmox passes $size in KILOBYTES, TrueNAS expects bytes in volsize
-    my $bytes = int($size) * 1024;
+    # Note: $bytes already calculated above in space check (size in KiB * 1024)
     my $blocksize = $scfg->{zvol_blocksize};
 
     my $create_payload = {
@@ -1663,7 +1983,25 @@ sub alloc_image {
         # normalize id from either WS result or REST (hashref)
         $extent_id = ref($ext) eq 'HASH' ? $ext->{id} : $ext;
     }
-    die "failed to create extent for $zname\n" if !defined $extent_id;
+    if (!defined $extent_id) {
+        die sprintf(
+            "Failed to create iSCSI extent for disk '%s'\n\n" .
+            "Dataset: %s\n" .
+            "zvol path: %s\n" .
+            "Extent name: %s\n\n" .
+            "Common causes:\n" .
+            "  1. TrueNAS iSCSI service is not running\n" .
+            "     -> Check: System Settings > Services > iSCSI (should be RUNNING)\n" .
+            "  2. ZFS dataset creation succeeded but zvol is not accessible\n" .
+            "     -> Verify zvol exists: zfs list -t volume | grep %s\n" .
+            "  3. API key lacks 'Sharing' write permissions\n" .
+            "     -> Check: Credentials > API Keys > Verify permissions\n" .
+            "  4. Extent name conflict with existing extent\n" .
+            "     -> Check: Shares > iSCSI > Extents for duplicate names\n\n" .
+            "TrueNAS logs: /var/log/middlewared.log\n",
+            $zname, $full_ds, $zvol_path, $zname, $zname
+        );
+    }
 
     # 3) Map extent to our shared target (targetextent.create); lunid is auto-assigned if not given
     my $target_id = _resolve_target_id($scfg);
@@ -1684,7 +2022,25 @@ sub alloc_image {
         (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
     } @$maps;
     my $lun = $tx_map ? $tx_map->{lunid} : undef;
-    die "could not determine assigned LUN for $zname\n" if !defined $lun;
+    if (!defined $lun) {
+        die sprintf(
+            "Could not determine assigned LUN for disk '%s'\n\n" .
+            "Target ID: %d\n" .
+            "Extent ID: %d\n" .
+            "Extent name: %s\n" .
+            "Total target-extent mappings found: %d\n\n" .
+            "This usually means:\n" .
+            "  1. Target-extent mapping creation failed silently\n" .
+            "  2. TrueNAS cache not yet updated (rare)\n" .
+            "  3. API query returned stale data\n\n" .
+            "Troubleshooting:\n" .
+            "  - Check TrueNAS GUI: Shares > iSCSI > Targets > Associated Targets\n" .
+            "  - Verify extent '%s' is mapped to target ID %d\n" .
+            "  - Check TrueNAS logs: /var/log/middlewared.log\n" .
+            "  - Verify API has 'Sharing' read permissions\n",
+            $zname, $target_id, $extent_id, $zname, scalar(@$maps), $zname, $target_id
+        );
+    }
 
     # 5) Ensure iSCSI login, then refresh initiator view on this node
     if (!_target_sessions_active($scfg)) {
@@ -1727,7 +2083,32 @@ sub alloc_image {
         usleep(500_000); # 500ms between attempts
     }
 
-    die "Volume created but device not accessible for LUN $lun after 10 seconds\n" unless $device_ready;
+    if (!$device_ready) {
+        die sprintf(
+            "Volume created but device not accessible after 10 seconds\n\n" .
+            "LUN: %d\n" .
+            "Target IQN: %s\n" .
+            "Dataset: %s\n" .
+            "Disk name: %s\n\n" .
+            "The zvol and iSCSI configuration were created successfully,\n" .
+            "but the Linux block device did not appear on this node.\n\n" .
+            "Common causes:\n" .
+            "  1. iSCSI session not logged in or stale\n" .
+            "     -> Check: iscsiadm -m session\n" .
+            "     -> Fix: iscsiadm -m node -T %s -p %s --login\n" .
+            "  2. udev rules preventing device creation\n" .
+            "     -> Check: ls -la /dev/disk/by-path/ | grep %s\n" .
+            "  3. Multipath misconfiguration (if enabled)\n" .
+            "     -> Check: multipath -ll\n" .
+            "  4. Firewall blocking iSCSI traffic (port 3260)\n" .
+            "     -> Check: iptables -L | grep 3260\n\n" .
+            "The volume exists on TrueNAS but needs manual cleanup or\n" .
+            "re-login to iSCSI target to become accessible.\n",
+            $lun, $scfg->{target_iqn}, $full_ds, $zname,
+            $scfg->{target_iqn}, $scfg->{discovery_portal},
+            $scfg->{target_iqn}
+        );
+    }
 
     # 7) Return our encoded volname so Proxmox can store it in the VM config
     my $volname = "vol-$zname-lun$lun";
@@ -1810,9 +2191,11 @@ sub free_image {
             my $err = $@ // '';
             if ($scfg->{force_delete_on_inuse} && $in_use->($err)) {
                 $need_force_logout = 1;
-            } else {
+            } elsif ($err !~ /does not exist|ENOENT|InstanceNotFound/i) {
+                # Only warn if resource actually exists - ENOENT means already cleaned up
                 warn "warning: delete targetextent id=$id failed: $err";
             }
+            # Silently ignore "does not exist" errors - resource already gone
         }
     }
 
@@ -1828,9 +2211,11 @@ sub free_image {
             my $err = $@ // '';
             if ($scfg->{force_delete_on_inuse} && $in_use->($err)) {
                 $need_force_logout = 1;
-            } else {
+            } elsif ($err !~ /does not exist|ENOENT|InstanceNotFound/i) {
+                # Only warn if resource actually exists - ENOENT means already cleaned up
                 warn "warning: delete extent id=$eid failed: $err";
             }
+            # Silently ignore "does not exist" errors - resource already gone
         }
     }
 
@@ -1951,9 +2336,14 @@ sub free_image {
             }
             syslog('info', "Dataset $full_ds deletion completed successfully after retry");
             $need_force_logout = 1;
-        } or warn "warning: delete dataset $full_ds failed after retry: $@";
+        } or do {
+            my $err = $@ // '';
+            warn "warning: delete dataset $full_ds failed after retry: $err" unless $err =~ /does not exist|ENOENT|InstanceNotFound/i;
+        };
     } elsif ($@) {
-        warn "warning: delete dataset $full_ds failed: $@";
+        my $err = $@ // '';
+        # Only warn if dataset actually exists - ENOENT means already cleaned up
+        warn "warning: delete dataset $full_ds failed: $err" unless $err =~ /does not exist|ENOENT|InstanceNotFound/i;
     }
 
     # 5) Skip re-login after volume deletion - the device is gone, no need to reconnect
@@ -2125,9 +2515,28 @@ sub status {
         }
     };
     if ($@) {
-        # Mark storage as inactive if API call fails (e.g., network issue, unreachable from this node)
-        syslog('warning', "TrueNAS storage '$storeid' status check failed: $@");
-        $active = 0;
+        my $err = $@;
+
+        # Distinguish between connectivity issues and actual errors
+        if ($err =~ /timeout|timed out|connection refused|connection reset|unreachable|network|ssl.*error/i) {
+            # Network/connectivity issue - mark as inactive (temporary)
+            syslog('info', "TrueNAS storage '$storeid' marked inactive (connectivity issue): $err");
+            $active = 0;
+        } elsif ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
+            # Dataset doesn't exist - this is a configuration error
+            syslog('error', "TrueNAS storage '$storeid' configuration error (dataset not found): $err");
+            $active = 0;
+        } elsif ($err =~ /401|403|authentication|unauthorized|forbidden/i) {
+            # Authentication/permission issue - configuration error
+            syslog('error', "TrueNAS storage '$storeid' authentication failed (check API key): $err");
+            $active = 0;
+        } else {
+            # Other errors - mark inactive but log as warning for investigation
+            syslog('warning', "TrueNAS storage '$storeid' status check failed: $err");
+            $active = 0;
+        }
+
+        # Return zeros for all capacity metrics when inactive
         $total = 0;
         $avail = 0;
         $used  = 0;
