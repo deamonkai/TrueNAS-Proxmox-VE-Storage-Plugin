@@ -4,9 +4,11 @@ Documentation for included tools and utilities to help manage the TrueNAS Proxmo
 
 ## Overview
 
-The plugin includes several tools to simplify installation, testing, and cluster management:
+The plugin includes several tools to simplify installation, testing, cluster management, and maintenance:
 
 - **[Test Suite](#test-suite)** - Automated testing and validation
+- **[Health Check Tool](#health-check-tool)** - Quick health validation for monitoring
+- **[Orphan Cleanup Tool](#orphan-cleanup-tool)** - Find and remove orphaned iSCSI resources
 - **[Version Check Script](#version-check-script)** - Check plugin version across cluster
 - **[Cluster Update Script](#cluster-update-script)** - Deploy plugin to all cluster nodes
 - **[Tools Directory](#tools-directory-structure)** - Location and organization
@@ -16,6 +18,8 @@ The plugin includes several tools to simplify installation, testing, and cluster
 ```
 tools/
 ├── truenas-plugin-test-suite.sh    # Automated test suite
+├── health-check.sh                  # Health validation tool
+├── cleanup-orphans.sh               # Orphan resource cleanup
 ├── update-cluster.sh                # Cluster deployment script
 └── check-version.sh                 # Version checker for cluster
 ```
@@ -96,6 +100,279 @@ tail -f /tmp/truenas-plugin-test-suite-$(date +%Y%m%d)-*.log
 ### See Also
 
 Complete test suite documentation: [Testing Guide](Testing.md)
+
+---
+
+## Health Check Tool
+
+### Overview
+
+The health check tool (`health-check.sh`) performs quick validation of the plugin installation and storage health. It's designed for monitoring integration and troubleshooting.
+
+**Location**: `tools/health-check.sh`
+
+### Features
+
+- **12 Comprehensive Checks** - Validates all critical components
+- **Multiple Output Modes** - Normal, quiet, and JSON output
+- **Monitoring Integration** - Standard exit codes for alerting systems
+- **Orphan Detection** - Integrates with cleanup tool to detect issues
+- **Color-coded Results** - Clear visual status indicators
+
+### Usage
+
+#### Basic Syntax
+
+```bash
+./health-check.sh [storage-name] [--quiet] [--json]
+```
+
+**Parameters**:
+- `storage-name`: Name of TrueNAS storage to check
+- `--quiet`: Minimal output (summary only)
+- `--json`: JSON output for monitoring tools
+
+**Exit Codes**:
+- `0` - All checks passed (HEALTHY)
+- `1` - Warnings detected (WARNING)
+- `2` - Critical errors detected (CRITICAL)
+
+#### Examples
+
+**Normal Mode (Detailed)**:
+```bash
+cd tools/
+./health-check.sh truenas-storage
+
+# Output:
+# === TrueNAS Plugin Health Check ===
+# Storage: truenas-storage
+#
+# ✓ Plugin file: Installed v1.0.0
+# ✓ Storage configuration: Configured
+# ✓ Storage status: Active (264% free)
+# ✓ Content type: images
+# ✓ TrueNAS API: Reachable on 10.15.14.172:443
+# ✓ Dataset: pve_test/pve-storage
+# ✓ Target IQN: iqn.2005-10.org.freenas.ctl:proxmox
+# ✓ Discovery portal: 10.15.14.172:3260
+# ✓ iSCSI sessions: 1 active session(s)
+# ⊘ Multipath: Not enabled
+# ✓ Orphaned resources: No orphans found
+# ✓ PVE daemon: Running
+#
+# === Health Summary ===
+# Checks passed: 11/12
+# Warnings: 0
+# Errors: 0
+# Status: HEALTHY
+```
+
+**Quiet Mode (Summary Only)**:
+```bash
+cd tools/
+./health-check.sh truenas-storage --quiet
+
+# Output:
+# === Health Summary ===
+# Checks passed: 11/12
+# Status: HEALTHY
+```
+
+**JSON Mode (Monitoring)**:
+```bash
+cd tools/
+./health-check.sh truenas-storage --json
+
+# Output:
+# {
+#   "storage": "truenas-storage",
+#   "status": "HEALTHY",
+#   "checks": [
+#     {"check": "Plugin file", "status": "OK", "message": "Installed v1.0.0"},
+#     {"check": "Storage configuration", "status": "OK", "message": "Configured"},
+#     ...
+#   ],
+#   "errors": 0,
+#   "warnings": 0,
+#   "passed": 11,
+#   "total": 12
+# }
+```
+
+### Health Checks Performed
+
+The tool performs these 12 checks:
+
+1. **Plugin File** - Verifies plugin is installed and detects version
+2. **Storage Configuration** - Checks `/etc/pve/storage.cfg` has storage entry
+3. **Storage Status** - Validates storage is active and reports free space
+4. **Content Type** - Ensures content type is set to "images"
+5. **TrueNAS API** - Tests API reachability and authentication
+6. **Dataset** - Verifies dataset is configured
+7. **Target IQN** - Validates iSCSI target IQN is set
+8. **Discovery Portal** - Checks discovery portal is configured
+9. **iSCSI Sessions** - Counts active iSCSI sessions to TrueNAS
+10. **Multipath** - Checks multipath configuration (skip if disabled)
+11. **Orphaned Resources** - Scans for orphaned iSCSI resources
+12. **PVE Daemon** - Verifies pvedaemon is running
+
+### Output Interpretation
+
+**Status Indicators**:
+- `✓` (Green) - Check passed (OK)
+- `✗` (Red) - Check failed (CRITICAL)
+- `⚠` (Yellow) - Check passed with warning (WARNING)
+- `⊘` (Gray) - Check skipped (SKIP)
+
+**Overall Status**:
+- `HEALTHY` - All checks passed or skipped
+- `WARNING` - One or more warnings detected
+- `CRITICAL` - One or more critical errors detected
+
+### When to Run
+
+**Monitoring Integration**:
+```bash
+# Cron job for hourly health checks
+0 * * * * /path/to/tools/health-check.sh truenas-storage --quiet || \
+  echo "TrueNAS storage health issue" | mail -s "Storage Alert" admin@example.com
+```
+
+**Troubleshooting**:
+- Before reporting issues - gather diagnostic info
+- After configuration changes - verify everything works
+- After network changes - validate connectivity
+- After TrueNAS updates - ensure compatibility
+
+**Pre-Operation Validation**:
+- Before VM deployments
+- Before storage migrations
+- Before cluster maintenance
+- Before plugin updates
+
+### Monitoring Integration
+
+#### Nagios/Icinga
+
+```bash
+#!/bin/bash
+# /usr/lib/nagios/plugins/check_truenas_storage.sh
+OUTPUT=$(/path/to/tools/health-check.sh truenas-storage --quiet)
+EXIT_CODE=$?
+echo "$OUTPUT"
+exit $EXIT_CODE
+```
+
+**Nagios config**:
+```
+define service {
+    service_description     TrueNAS Storage Health
+    check_command           check_truenas_storage
+    use                     generic-service
+}
+```
+
+#### Zabbix
+
+```bash
+# UserParameter in zabbix_agentd.conf
+UserParameter=truenas.health[*],/path/to/tools/health-check.sh $1 --json
+```
+
+**Zabbix item**:
+- Key: `truenas.health[truenas-storage]`
+- Type: Zabbix agent
+- Value type: Text
+
+#### Prometheus
+
+```bash
+#!/bin/bash
+# /var/lib/node_exporter/textfile_collector/truenas_health.prom
+OUTPUT=$(/path/to/tools/health-check.sh truenas-storage --json)
+STATUS=$(echo "$OUTPUT" | jq -r '.status')
+PASSED=$(echo "$OUTPUT" | jq -r '.passed')
+TOTAL=$(echo "$OUTPUT" | jq -r '.total')
+
+cat <<EOF > /var/lib/node_exporter/textfile_collector/truenas_health.prom
+# HELP truenas_health_status TrueNAS storage health status (0=healthy, 1=warning, 2=critical)
+# TYPE truenas_health_status gauge
+truenas_health_status{storage="truenas-storage"} $([ "$STATUS" = "HEALTHY" ] && echo 0 || [ "$STATUS" = "WARNING" ] && echo 1 || echo 2)
+
+# HELP truenas_health_checks_passed Number of health checks passed
+# TYPE truenas_health_checks_passed gauge
+truenas_health_checks_passed{storage="truenas-storage"} $PASSED
+
+# HELP truenas_health_checks_total Total number of health checks
+# TYPE truenas_health_checks_total gauge
+truenas_health_checks_total{storage="truenas-storage"} $TOTAL
+EOF
+```
+
+### Troubleshooting
+
+**"Error: Storage 'name' not found"**:
+- Storage name is incorrect
+- Storage is not a TrueNAS plugin storage
+- Check: `grep truenasplugin /etc/pve/storage.cfg`
+
+**"Plugin file: Not installed"**:
+- Plugin not installed
+- Use: `ls -la /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm`
+- Fix: Run installation or `update-cluster.sh`
+
+**"TrueNAS API: Not reachable"**:
+- TrueNAS is offline
+- Network connectivity issue
+- Firewall blocking port 443
+- Check: `ping TRUENAS_IP` and `curl -k https://TRUENAS_IP/api/v2.0/system/info`
+
+**"Storage status: Inactive"**:
+- Storage is disabled in Proxmox
+- Fix: `pvesm set truenas-storage --disable 0`
+
+**"iSCSI sessions: No active sessions"**:
+- iSCSI connection lost
+- Discovery portal unreachable
+- Check: `iscsiadm -m session`
+- Reconnect: `iscsiadm -m discovery -t st -p PORTAL_IP:3260`
+
+**"Orphaned resources: Found X orphans"**:
+- Orphaned iSCSI resources detected
+- Fix: Run `./cleanup-orphans.sh truenas-storage`
+
+### Best Practices
+
+1. **Schedule Regular Checks**:
+   ```bash
+   # Hourly health check
+   0 * * * * /path/to/tools/health-check.sh truenas-storage --quiet
+   ```
+
+2. **Integrate with Monitoring**:
+   - Use JSON output for parsing
+   - Alert on exit code 2 (CRITICAL)
+   - Warn on exit code 1 (WARNING)
+
+3. **Document Baselines**:
+   ```bash
+   # Capture healthy baseline
+   ./health-check.sh truenas-storage > baseline-health.txt
+   ```
+
+4. **Run Before Changes**:
+   ```bash
+   # Pre-change validation
+   ./health-check.sh truenas-storage || echo "WARNING: Starting with unhealthy storage"
+   ```
+
+5. **Combine with Other Tools**:
+   ```bash
+   # Comprehensive health check
+   ./health-check.sh truenas-storage && \
+   ./cleanup-orphans.sh truenas-storage --dry-run
+   ```
 
 ---
 
@@ -567,8 +844,195 @@ done
 | Tool | Purpose | Location | Documentation |
 |------|---------|----------|---------------|
 | Test Suite | Automated testing and validation | `tools/truenas-plugin-test-suite.sh` | [Testing Guide](Testing.md) |
+| Health Check | Quick health validation for monitoring | `tools/health-check.sh` | This page |
 | Cluster Update | Deploy plugin to cluster nodes | `tools/update-cluster.sh` | This page |
 | Version Check | Check plugin version across cluster | `tools/check-version.sh` | This page |
+| Orphan Cleanup | Find and remove orphaned iSCSI resources | `tools/cleanup-orphans.sh` | This page |
+
+---
+
+## Orphan Cleanup Tool
+
+### Overview
+
+The orphan cleanup tool (`cleanup-orphans.sh`) detects and removes orphaned iSCSI resources on TrueNAS that result from failed operations or interrupted workflows.
+
+**Location**: `tools/cleanup-orphans.sh`
+
+### What Are Orphaned Resources?
+
+Orphaned resources occur when storage operations fail partway through:
+
+1. **Orphaned Extents** - iSCSI extents pointing to deleted/missing zvols
+2. **Orphaned Target-Extent Mappings** - Mappings referencing deleted extents
+3. **Orphaned Zvols** - Zvols without corresponding iSCSI extents
+
+**Common Causes**:
+- VM deletion failures
+- Network interruptions during volume creation
+- Manual cleanup on TrueNAS without updating Proxmox
+- Power failures during operations
+
+### Usage
+
+#### Basic Syntax
+```bash
+./cleanup-orphans.sh [storage-name] [--force] [--dry-run]
+```
+
+**Parameters**:
+- `storage-name`: Name of TrueNAS storage to scan
+- `--force`: Skip confirmation prompt
+- `--dry-run`: Show what would be deleted without deleting
+
+#### Examples
+
+**List Available Storages**:
+```bash
+cd tools/
+./cleanup-orphans.sh
+
+# Output:
+# === Available TrueNAS Storage ====
+# truenas-storage
+# truenas-backup
+```
+
+**Detect Orphans (Interactive)**:
+```bash
+cd tools/
+./cleanup-orphans.sh truenas-storage
+
+# Output:
+# === TrueNAS Orphan Resource Detection ===
+# Storage: truenas-storage
+#
+# Fetching iSCSI extents...
+# Fetching zvols...
+# Fetching target-extent mappings...
+#
+# === Analyzing Resources ===
+# Checking for extents without zvols...
+# Checking for target-extent mappings without extents...
+# Checking for zvols without extents...
+#
+# Found 3 orphaned resource(s):
+#
+#   [EXTENT] vm-999-disk-0 (ID: 42)
+#            Reason: zvol missing: tank/proxmox/vm-999-disk-0
+#   [TARGET-EXTENT] mapping-15 (ID: 15)
+#                   Reason: extent missing: 40 (target: 2)
+#   [ZVOL] vm-998-disk-1
+#          Reason: no extent pointing to this zvol
+#
+# WARNING: This will permanently delete these orphaned resources!
+#
+# Delete these orphaned resources? (yes/N):
+```
+
+**Dry Run (Preview Only)**:
+```bash
+cd tools/
+./cleanup-orphans.sh truenas-storage --dry-run
+
+# Shows what would be deleted without making changes
+# Dry run complete. No resources were deleted.
+```
+
+**Automated Cleanup (No Prompt)**:
+```bash
+cd tools/
+./cleanup-orphans.sh truenas-storage --force
+
+# Deletes all orphaned resources without confirmation
+```
+
+### Output Interpretation
+
+**Resource Types**:
+- `[EXTENT]` - Orphaned iSCSI extent
+- `[TARGET-EXTENT]` - Orphaned target-extent mapping
+- `[ZVOL]` - Orphaned zvol dataset
+
+**Status Messages**:
+- `✓ Deleted` - Resource successfully removed
+- `✗ Failed to delete` - Error during deletion (check permissions/API)
+
+### Safety Features
+
+1. **Interactive Confirmation** - Prompts before deletion (unless `--force`)
+2. **Dry Run Mode** - Preview changes without modifying anything
+3. **Dataset Isolation** - Only scans resources under configured dataset
+4. **Ordered Deletion** - Removes dependencies first (mappings → extents → zvols)
+5. **Error Logging** - Failed deletions are reported but don't stop cleanup
+
+### When to Run
+
+**Regular Maintenance**:
+```bash
+# Monthly check for orphans
+0 0 1 * * /path/to/tools/cleanup-orphans.sh truenas-storage --force
+```
+
+**After Issues**:
+- After failed VM deletions
+- After network interruptions during storage operations
+- After manual cleanup on TrueNAS
+- When storage space doesn't match expectations
+
+**Before Major Operations**:
+- Before storage migrations
+- Before cluster maintenance
+- Before TrueNAS upgrades
+
+### Troubleshooting
+
+**"Error: Storage 'name' not found"**:
+- Storage name is incorrect
+- Storage is not a TrueNAS plugin storage
+- Check: `grep truenasplugin /etc/pve/storage.cfg`
+
+**"Error: Failed to fetch extents from TrueNAS API"**:
+- TrueNAS is offline or unreachable
+- API key is invalid or expired
+- Check: `curl -k -H "Authorization: Bearer YOUR_KEY" https://TRUENAS_IP/api/v2.0/system/info`
+
+**"Failed to cleanup orphaned extent"**:
+- API key lacks permissions
+- Resource is in use (shouldn't happen for true orphans)
+- Check TrueNAS logs: System Settings → Shell → `tail -f /var/log/middlewared.log`
+
+**No Orphans Found But Space Is Missing**:
+- Snapshots may be consuming space (not considered orphans)
+- Check snapshots: TrueNAS → Datasets → [dataset] → Snapshots
+- Use: `zfs list -t snapshot -o name,used tank/proxmox`
+
+### Best Practices
+
+1. **Run with --dry-run first** - Always preview before deleting
+2. **Schedule regular scans** - Monthly maintenance prevents accumulation
+3. **Run after incidents** - Clean up after failed operations
+4. **Backup before cleanup** - Snapshot TrueNAS pool before major cleanup
+5. **Check logs** - Review syslog for cleanup results
+
+**Example Maintenance Script**:
+```bash
+#!/bin/bash
+# Monthly orphan cleanup with notification
+cd /path/to/tools/
+STORAGE="truenas-storage"
+
+# Dry run to detect
+ORPHANS=$(./cleanup-orphans.sh "$STORAGE" --dry-run | grep -c "Found.*orphaned")
+
+if [ "$ORPHANS" -gt 0 ]; then
+    echo "Found $ORPHANS orphaned resources on $STORAGE" | \
+      mail -s "TrueNAS Orphan Alert" admin@example.com
+
+    # Cleanup
+    ./cleanup-orphans.sh "$STORAGE" --force
+fi
+```
 
 ---
 
