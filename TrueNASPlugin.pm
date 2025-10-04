@@ -11,7 +11,7 @@ use MIME::Base64 qw(encode_base64);
 use Digest::SHA qw(sha1);
 use IO::Socket::INET;
 use IO::Socket::SSL;
-use Time::HiRes qw(usleep);
+use Time::HiRes qw(usleep sleep);
 use Socket qw(inet_ntoa);
 use LWP::UserAgent;
 use HTTP::Request;
@@ -21,7 +21,6 @@ use Carp qw(carp croak);
 use PVE::Tools qw(run_command trim);
 use PVE::Storage::Plugin;
 use PVE::JSONSchema qw(get_standard_option);
-use Sys::Syslog qw(syslog);
 use base qw(PVE::Storage::Plugin);
 
 # Simple cache for API results (static data)
@@ -148,7 +147,7 @@ sub _retry_with_backoff {
         $delay += $jitter;
 
         syslog('info', "Retry attempt $attempt/$max_retries for $operation_name after ${delay}s delay (error: $last_error)");
-        sleep($delay);
+        Time::HiRes::sleep($delay);
     }
 
     # Should never reach here, but just in case
@@ -156,7 +155,19 @@ sub _retry_with_backoff {
 }
 
 # ======== Storage plugin identity ========
-sub api { return 11; } # storage plugin API version
+our $PVE_STORAGE_API_FALLBACK = 11;
+sub api {
+    # Prefer the base class' advertised API version if exported; fall back to 11.
+    my $ver;
+    eval {
+        no strict 'refs';
+        # Some Proxmox releases expose API_VERSION or a sub on the base class.
+        $ver = ${'PVE::Storage::Plugin::API_VERSION'} if defined ${'PVE::Storage::Plugin::API_VERSION'};
+        $ver //= PVE::Storage::Plugin->can('api') ? PVE::Storage::Plugin->api() : undef;
+    };
+    $ver //= $PVE_STORAGE_API_FALLBACK;
+    return int($ver);
+}
 sub type { return 'truenasplugin'; } # storage.cfg "type"
 sub plugindata {
     return {
@@ -439,6 +450,7 @@ sub _ua($scfg) {
             SSL_verify_mode => $scfg->{api_insecure} ? 0x00 : 0x02,
         }
     );
+    $ua->ssl_opts( SSL_ca_file => '/etc/ssl/certs/ca-certificates.crt' ) if !$scfg->{api_insecure};
     return $ua;
 }
 sub _rest_base($scfg) {
@@ -479,7 +491,7 @@ sub _ws_open($scfg) {
     my $path = '/api/current';
 
     # Add small delay to avoid rate limiting
-    usleep(100_000); # 100ms delay
+    Time::HiRes::usleep(100_000); # 100ms delay
 
     my $sock;
     if ($scheme eq 'wss') {
@@ -565,12 +577,20 @@ sub _ws_read_exact {
     my ($sock, $ref, $want) = @_;
     $$ref = '' if !defined $$ref;
     my $got = 0;
+    my $retries = 0;
     while ($got < $want) {
         my $r = $sock->sysread($$ref, $want - $got, $got);
-        return undef if !defined $r || $r == 0;
+        if (!defined $r) {
+            return undef; # hard error
+        } elsif ($r == 0) {
+            # transient: allow a few retries to better tolerate kernel/SSL buffering
+            last if ++$retries > 5;
+            Time::HiRes::usleep(10_000);
+            next;
+        }
         $got += $r;
     }
-    return 1;
+    return ($got == $want) ? 1 : undef;
 }
 sub _ws_recv_text {
     my $sock = shift;
@@ -578,7 +598,21 @@ sub _ws_recv_text {
     _ws_read_exact($sock, \$hdr, 2) or die "WS read hdr failed";
     my ($b1, $b2) = unpack('CC', $hdr);
     my $opcode = $b1 & 0x0f;
-    die "WS: unexpected opcode $opcode" if $opcode != 1; # text only
+    if ($opcode == 0x9) { # PING
+        # read and drop payload, then recurse to read the next frame
+        my $len_byte = $b2 & 0x7f;
+        my $ext = '';
+        if ($len_byte == 126) { _ws_read_exact($sock, \$ext, 2); $len_byte = unpack('n', $ext); }
+        elsif ($len_byte == 127) { _ws_read_exact($sock, \$ext, 8); $len_byte = unpack('Q>', $ext); }
+        my $skip = '';
+        _ws_read_exact($sock, \$skip, $len_byte);
+        return _ws_recv_text($sock);
+    } elsif ($opcode == 0xA) { # PONG
+        # simply read next frame
+        return _ws_recv_text($sock);
+    } elsif ($opcode != 1) {
+        die "WS: unexpected opcode $opcode"; # still fail on binary/close etc.
+    }
     my $masked = ($b2 & 0x80) ? 1 : 0; # server MUST NOT mask
     my $len    = ($b2 & 0x7f);
     if ($len == 126) {
