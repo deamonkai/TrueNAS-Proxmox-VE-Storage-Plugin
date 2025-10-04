@@ -50,6 +50,12 @@
 
 #### 1. Install Plugin
 ```bash
+# this performs the same function as the steps below, and creates the directory if it doesn't exist
+./install.sh
+```
+OR
+
+```bash
 # Copy the plugin file
 cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
 
